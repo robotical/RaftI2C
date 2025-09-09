@@ -749,6 +749,34 @@ String BusStatusMgr::getDebugJSON(bool includeBraces) const
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Set device polling interval (us) for a specific address
+/// @param address address
+/// @param pollIntervalUs poll interval in microseconds
+/// @return true if address found and updated
+bool BusStatusMgr::setDevicePollInterval(BusElemAddrType address, uint32_t pollIntervalUs)
+{
+    // Obtain semaphore
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(5)) != pdTRUE)
+        return false;
+
+    bool updated = false;
+    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    if (pAddrStatus)
+    {
+        pAddrStatus->deviceStatus.deviceIdentPolling.pollIntervalUs = pollIntervalUs;
+        if (pAddrStatus->deviceStatus.deviceIdentPolling.lastPollTimeUs != 0 && pollIntervalUs > 0)
+        {
+            uint64_t nowUs = (uint64_t)millis() * 1000ULL;
+            pAddrStatus->deviceStatus.deviceIdentPolling.lastPollTimeUs = nowUs - pollIntervalUs;
+        }
+        updated = true;
+    }
+
+    xSemaphoreGive(_busElemStatusMutex);
+    return updated;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// @brief Register for device data notifications
 /// @param addrAndSlot address
 /// @param dataChangeCB Callback for data change
