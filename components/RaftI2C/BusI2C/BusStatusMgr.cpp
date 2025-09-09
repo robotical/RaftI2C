@@ -546,6 +546,10 @@ bool BusStatusMgr::getPendingIdentPoll(uint64_t timeNowUs, DevicePollingInfo& po
     // Check for any pending requests
     for (BusAddrStatus& addrStatus : _addrStatus)
     {
+        // only check online devices
+        if (!addrStatus.isOnline)
+            continue;
+            
         // Check if a poll is due
         if (addrStatus.deviceStatus.getPendingIdentPollInfo(timeNowUs, pollInfo))
         {
