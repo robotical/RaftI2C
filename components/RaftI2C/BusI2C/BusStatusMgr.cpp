@@ -764,11 +764,6 @@ bool BusStatusMgr::setDevicePollInterval(BusElemAddrType address, uint32_t pollI
     if (pAddrStatus)
     {
         pAddrStatus->deviceStatus.deviceIdentPolling.pollIntervalUs = pollIntervalUs;
-        if (pAddrStatus->deviceStatus.deviceIdentPolling.lastPollTimeUs != 0 && pollIntervalUs > 0)
-        {
-            uint64_t nowUs = (uint64_t)millis() * 1000ULL;
-            pAddrStatus->deviceStatus.deviceIdentPolling.lastPollTimeUs = nowUs - pollIntervalUs;
-        }
         updated = true;
     }
 
