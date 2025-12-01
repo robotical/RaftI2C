@@ -14,6 +14,7 @@
 #include "unity_test_runner.h"
 
 #include "PollDataAggregator.h"
+#include "OfflineDataStore.h"
 
 // static const char* MODULE_PREFIX = "test_i2c_data_agg";
 
@@ -155,4 +156,47 @@ TEST_CASE("Test PollDataAggregator Put and Get Multiple", "[PollDataAggregator]"
     TEST_ASSERT_TRUE(aggregator.get(dataOut, elemSize, 5) == 3);
     TEST_ASSERT_TRUE(dataTest5to7 == dataOut);
     TEST_ASSERT_FALSE(aggregator.get(dataOut));
+}
+
+TEST_CASE("OfflineDataStore drops oldest and tracks drops", "[OfflineDataStore]")
+{
+    OfflineDataStore store;
+    store.init(2, 3, 2, 1000);
+    std::vector<uint8_t> d1 = {0x00, 0x01, 0x02};
+    std::vector<uint8_t> d2 = {0x00, 0x03, 0x04};
+    std::vector<uint8_t> d3 = {0x00, 0x05, 0x06};
+    TEST_ASSERT_TRUE(store.put(1000, 1, d1));
+    TEST_ASSERT_TRUE(store.put(2000, 2, d2));
+    TEST_ASSERT_TRUE(store.put(3000, 3, d3));
+    OfflineDataStats stats = store.getStats();
+    TEST_ASSERT_EQUAL_UINT32(2, stats.depth);
+    TEST_ASSERT_EQUAL_UINT32(1, stats.drops);
+    std::vector<uint8_t> out;
+    uint32_t respSize = 0;
+    std::vector<OfflineDataMeta> metas;
+    TEST_ASSERT_EQUAL_UINT32(2, store.get(out, respSize, 0, metas));
+    std::vector<uint8_t> expected = d2;
+    expected.insert(expected.end(), d3.begin(), d3.end());
+    TEST_ASSERT_EQUAL_UINT32(3, metas.back().seq);
+    TEST_ASSERT_EQUAL_UINT32(3, respSize);
+    TEST_ASSERT_EQUAL_UINT32(expected.size(), out.size());
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(expected.data(), out.data(), expected.size());
+}
+
+TEST_CASE("OfflineDataStore records timestamp wrap", "[OfflineDataStore]")
+{
+    OfflineDataStore store;
+    store.init(3, 2, 2, 1000);
+    std::vector<uint8_t> d1 = {0xff, 0xf0}; // large ts close to wrap
+    std::vector<uint8_t> d2 = {0x00, 0x05}; // wrap to small value
+    TEST_ASSERT_TRUE(store.put(10000 * 1000ULL, 10, d1));
+    TEST_ASSERT_TRUE(store.put(20000 * 1000ULL, 11, d2));
+    OfflineDataStats stats = store.getStats();
+    TEST_ASSERT_EQUAL_UINT32(1, stats.tsWrapCount);
+    std::vector<uint8_t> out;
+    uint32_t respSize = 0;
+    std::vector<OfflineDataMeta> metas;
+    TEST_ASSERT_EQUAL_UINT32(2, store.get(out, respSize, 0, metas));
+    TEST_ASSERT_TRUE(metas.size() == 2);
+    TEST_ASSERT_TRUE(metas.back().tsBaseMs >= (1ULL << 16));
 }

@@ -15,6 +15,9 @@
 #include "RaftJson.h"
 #include <vector>
 #include <list>
+#include <map>
+#include <string>
+#include <set>
 
 class DeviceIdentMgr : public RaftBusDevicesIF
 {
@@ -60,13 +63,14 @@ public:
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Get queued device data in JSON format
     /// @return JSON string
-    virtual String getQueuedDeviceDataJson() const override final;
+    virtual String getQueuedDeviceDataJson(uint32_t maxResponsesToReturn = 0, uint32_t* pRemaining = nullptr) const override final;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Get queued device data in binary format
     /// @param connMode connection mode (inc bus number)
     /// @return Binary data vector
-    virtual std::vector<uint8_t> getQueuedDeviceDataBinary(uint32_t connMode) const override final;
+    virtual std::vector<uint8_t> getQueuedDeviceDataBinary(uint32_t connMode, uint32_t maxResponsesToReturn = 0,
+                uint32_t* pRemaining = nullptr) const override final;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Get decoded poll responses
@@ -113,6 +117,60 @@ public:
     virtual String getDebugJSON(bool includeBraces) const override final;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// @brief Offline stats passthrough
+    virtual OfflineDataStats getOfflineStats(BusElemAddrType address) const override final
+    {
+        return _busStatusMgr.getOfflineStats(address);
+    }
+
+    /// @brief Override max per publish for offline backlog
+    void setOfflineMaxPerPublishOverride(uint32_t maxPerPublish) override;
+
+    /// @brief Update selection of addresses/types allowed for draining offline buffers
+    void setOfflineDrainSelection(const std::vector<BusElemAddrType>& addresses, const std::vector<std::string>& typeNames,
+                bool drainOnlySelected) override;
+
+    /// @brief Pause/resume buffering for addresses
+    void setOfflineBufferPaused(const std::vector<BusElemAddrType>& addresses, bool paused) override;
+
+    /// @brief Estimate offline allocation bytes for addresses without applying changes
+    bool estimateOfflineAllocations(const std::vector<BusElemAddrType>& addresses,
+                std::map<BusElemAddrType, EstAllocInfo>& allocBytesOut) const override;
+
+    /// @brief Pause/resume draining for addresses
+    void setOfflineDrainPaused(const std::vector<BusElemAddrType>& addresses, bool paused) override;
+
+    /// @brief Pause/resume draining due to link availability
+    void setOfflineDrainLinkPaused(bool paused) override;
+
+    /// @brief Reset offline buffers for addresses
+    void resetOfflineBuffers(const std::vector<BusElemAddrType>& addresses) override;
+
+    /// @brief Snapshot control state for diagnostics
+    void getOfflineControlSnapshot(std::set<BusElemAddrType>& bufferPaused, std::set<BusElemAddrType>& drainPaused,
+                std::set<BusElemAddrType>& drainSelectedAddrs, std::set<std::string>& drainSelectedTypes,
+                bool& drainOnlySelected, uint32_t& maxPerPublishOverride,
+                bool& globalBufferPaused, bool& globalDrainPaused,
+                std::map<BusElemAddrType, uint32_t>& rateOverridesUs) const override;
+
+    /// @brief Peek at offline data without consuming
+    String peekOfflineDataJson(const std::vector<BusElemAddrType>& addresses,
+                uint32_t startIdx, uint32_t maxResponsesToReturn, uint32_t maxBytes,
+                uint32_t& totalRemaining) const override;
+
+    /// @brief Apply a rate override (ms) while buffering
+    bool applyOfflineRateOverride(const std::vector<BusElemAddrType>& addresses, uint32_t pollRateMs) override;
+
+    /// @brief Clear any rate overrides and restore defaults
+    bool clearOfflineRateOverride(const std::vector<BusElemAddrType>& addresses) override;
+
+    /// @brief Rebalance offline buffer depths across devices
+    bool rebalanceOfflineBuffers(const std::vector<BusElemAddrType>& addresses) override;
+
+    /// @brief Get device type name for an address
+    bool getDeviceTypeName(BusElemAddrType address, std::string& typeName) const override;
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Identify device
     /// @param 
     /// @param deviceStatus (out) device status
@@ -151,7 +209,9 @@ private:
     /// @param responseSize size of poll response data
     /// @return JSON string
     String deviceStatusToJson(BusElemAddrType address, bool isOnline, uint16_t deviceTypeIndex, 
-                    const std::vector<uint8_t>& devicePollResponseData, uint32_t responseSize) const;
+                    const std::vector<uint8_t>& devicePollResponseData, uint32_t responseSize,
+                    bool isBacklog, uint32_t remainingCount, const OfflineDataMeta* pFirstMeta,
+                    const OfflineDataStats& stats) const;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Decode one or more poll responses for a device
@@ -167,6 +227,46 @@ private:
                     void* pStructOut, uint32_t structOutSize, 
                     uint16_t maxRecCount, RaftBusDeviceDecodeState& decodeState) const;
 
+    struct OfflineBufferPolicy
+    {
+        uint32_t perDeviceMaxBytes = 0;
+        uint32_t globalMaxBytes = 0;
+        uint32_t defaultWindowMs = 0;
+        uint32_t minSamples = 1;
+        uint32_t maxPerPublish = 0;
+        uint32_t memUsePermille = 750;
+        std::map<std::string, uint32_t> perDeviceWindowMs;
+    };
+
+    uint32_t calcOfflineDepth(const DeviceTypeRecord& devTypeRec, const DevicePollingInfo& pollInfo) const;
+    void parseOfflineConfig(const RaftJsonIF& config);
+    void setOfflineStatsRemaining(uint32_t remaining, uint32_t* pRemaining) const;
+    uint32_t applyGlobalOfflineLimit(const DevicePollingInfo& pollInfo, uint32_t requestedDepth) const;
+    uint32_t getPerDevicePublishLimit(uint32_t maxResponsesToReturn) const;
+    bool isOfflineDrainAllowed(BusElemAddrType address, uint16_t deviceTypeIndex) const;
+    void applyOfflineControlsToDevice(BusElemAddrType address, DeviceStatus& deviceStatus);
+    void applyOfflineControlToExisting();
+    void applyOfflineControlToAddress(BusElemAddrType address, uint16_t deviceTypeIdx);
+    void computeOfflineControlFlags(BusElemAddrType address, const std::string& devTypeName,
+                bool& bufferPaused, bool& drainPaused, bool& restrictToSelection) const;
+    uint32_t computeDepthForAddress(BusElemAddrType address, const DevicePollingInfo& pollInfo) const;
+    bool applyRateOverrideToAddress(BusElemAddrType address, uint32_t pollRateMs, bool recordOriginal);
+    bool clearRateOverrideForAddress(BusElemAddrType address);
+
     // Debug
     static constexpr const char* MODULE_PREFIX = "RaftDevIdentMgr";
+
+    OfflineBufferPolicy _offlinePolicy;
+    uint32_t _maxPerPublishOverride = 0;
+    bool _drainOnlySelected = false;
+    std::set<BusElemAddrType> _drainSelectedAddrs;
+    std::set<std::string> _drainSelectedTypes;
+    std::set<BusElemAddrType> _bufferPausedAddrs;
+    std::set<BusElemAddrType> _drainPausedAddrs;
+    bool _globalBufferPaused = true;
+    bool _globalDrainPaused = true;
+    bool _linkDrainPaused = false;
+    SemaphoreHandle_t _offlineCtrlMutex = nullptr;
+    std::map<BusElemAddrType, uint32_t> _rateOverridesUs;
+    std::map<BusElemAddrType, uint32_t> _rateOverrideOriginalUs;
 };

@@ -47,6 +47,9 @@ void DevicePollingMgr::taskService(uint64_t timeNowUs)
             return;
         BusElemAddrType address = pollInfo.pollReqs[0].getAddress();
         BusI2CAddrAndSlot addrAndSlot = BusI2CAddrAndSlot::fromBusElemAddrType(address);
+        // LOG_I(MODULE_PREFIX, "poll addr %s intervalUs %u reqs %u sizeIncTs %u",
+        //             addrAndSlot.toString().c_str(), pollInfo.pollIntervalUs, (uint32_t)pollInfo.pollReqs.size(),
+        //             pollInfo.pollResultSizeIncTimestamp);
 
         // Get the next request index
         uint32_t nextReqIdx = pollInfo.partialPollNextReqIdx;

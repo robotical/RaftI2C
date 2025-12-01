@@ -666,7 +666,12 @@ bool BusStatusMgr::getBusElemAddresses(std::vector<BusElemAddrType>& addresses, 
     // Iterate address status records
     for (const BusAddrStatus& addrStatus : _addrStatus)
     {
-        bool includeAddr = !onlyAddressesWithIdentPollResponses || addrStatus.deviceStatus.dataAggregator.count() > 0;
+        OfflineDataStats offlineStats;
+        if (onlyAddressesWithIdentPollResponses)
+            offlineStats = addrStatus.deviceStatus.getOfflineStats();
+        bool includeAddr = !onlyAddressesWithIdentPollResponses || 
+                    (addrStatus.deviceStatus.dataAggregator.count() > 0) ||
+                    (offlineStats.depth > 0);
         if (includeAddr)
         {
             // Add address to list
@@ -692,6 +697,9 @@ uint32_t BusStatusMgr::getBusElemPollResponses(BusElemAddrType address, bool& is
             std::vector<uint8_t>& devicePollResponseData, 
             uint32_t& responseSize, uint32_t maxResponsesToReturn)
 {
+    isOnline = false;
+    deviceTypeIndex = 0;
+    responseSize = 0;
     // Obtain semaphore
     if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
         return 0;
@@ -720,6 +728,180 @@ uint32_t BusStatusMgr::getBusElemPollResponses(BusElemAddrType address, bool& is
 #endif
 
     return numResponses;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////    
+/// @brief Get bus element offline poll responses for a specific address
+/// @param address - address of device to get responses for
+/// @param isOnline - (out) true if device is online
+/// @param deviceTypeIndex - (out) device type index
+/// @param devicePollResponseData - (out) vector to store the device poll response data
+/// @param responseSize - (out) size of the response data
+/// @param maxResponsesToReturn - maximum number of responses to return (0 for no limit)
+/// @param metas - (out) metadata for the responses
+/// @param stats - (out) offline buffer stats after removal
+/// @return number of responses returned
+uint32_t BusStatusMgr::getBusElemOfflineResponses(BusElemAddrType address, bool& isOnline, uint16_t& deviceTypeIndex,
+            std::vector<uint8_t>& devicePollResponseData, uint32_t& responseSize,
+            uint32_t maxResponsesToReturn, std::vector<OfflineDataMeta>& metas, OfflineDataStats& stats)
+{
+    isOnline = false;
+    deviceTypeIndex = 0;
+    responseSize = 0;
+    stats = OfflineDataStats();
+    // Obtain semaphore
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+        return 0;
+
+    uint32_t numResponses = 0;
+    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    if (pAddrStatus)
+    {
+        isOnline = pAddrStatus->isOnline;
+        deviceTypeIndex = pAddrStatus->deviceStatus.getDeviceTypeIndex();
+        numResponses = pAddrStatus->deviceStatus.getOfflineResponses(devicePollResponseData, responseSize,
+                        maxResponsesToReturn, metas);
+        stats = pAddrStatus->deviceStatus.getOfflineStats();
+    }
+    xSemaphoreGive(_busElemStatusMutex);
+    return numResponses;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Peek at offline poll responses for a specific address
+/// @param address - address of device to get responses for
+/// @param isOnline - (out) true if device is online
+/// @param deviceTypeIndex - (out) device type index
+/// @param devicePollResponseData - (out) vector to store the device poll response data
+/// @param responseSize - (out) size of the response data
+/// @param startIdx - start offset from the oldest entry (0 = oldest)
+/// @param maxResponsesToReturn - maximum number of responses to return (0 for no limit)
+/// @param maxBytes - maximum bytes to return (0 for no limit)
+/// @param metas - (out) metadata for the responses
+/// @param stats - (out) offline buffer stats (unchanged by peek)
+/// @return number of responses returned
+uint32_t BusStatusMgr::peekBusElemOfflineResponses(BusElemAddrType address, bool& isOnline, uint16_t& deviceTypeIndex,
+            std::vector<uint8_t>& devicePollResponseData, uint32_t& responseSize,
+            uint32_t startIdx, uint32_t maxResponsesToReturn, uint32_t maxBytes,
+            std::vector<OfflineDataMeta>& metas, OfflineDataStats& stats)
+{
+    isOnline = false;
+    deviceTypeIndex = 0;
+    responseSize = 0;
+    stats = OfflineDataStats();
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+        return 0;
+
+    uint32_t numResponses = 0;
+    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    if (pAddrStatus)
+    {
+        isOnline = pAddrStatus->isOnline;
+        deviceTypeIndex = pAddrStatus->deviceStatus.getDeviceTypeIndex();
+        numResponses = pAddrStatus->deviceStatus.peekOfflineResponses(devicePollResponseData, responseSize,
+                    startIdx, maxResponsesToReturn, maxBytes, metas);
+        stats = pAddrStatus->deviceStatus.getOfflineStats();
+    }
+    xSemaphoreGive(_busElemStatusMutex);
+    return numResponses;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Get offline stats for an address
+OfflineDataStats BusStatusMgr::getOfflineStats(BusElemAddrType address) const
+{
+    OfflineDataStats stats;
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+        return stats;
+    const BusAddrStatus* pAddrStatus = findAddrStatusRecord(address);
+    if (pAddrStatus)
+        stats = pAddrStatus->deviceStatus.getOfflineStats();
+    xSemaphoreGive(_busElemStatusMutex);
+    return stats;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Total offline allocation bytes across devices
+uint32_t BusStatusMgr::getOfflineBytesInUse() const
+{
+    uint32_t total = 0;
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+        return 0;
+    for (const BusAddrStatus& addrStatus : _addrStatus)
+    {
+        total += addrStatus.deviceStatus.getOfflineAllocBytes();
+    }
+    xSemaphoreGive(_busElemStatusMutex);
+    return total;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Pause/resume buffering for an address
+bool BusStatusMgr::setOfflineBufferPaused(BusElemAddrType address, bool paused)
+{
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(2)) != pdTRUE)
+        return false;
+    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    if (!pAddrStatus)
+    {
+        xSemaphoreGive(_busElemStatusMutex);
+        return false;
+    }
+    pAddrStatus->deviceStatus.setOfflineBufferPaused(paused);
+    xSemaphoreGive(_busElemStatusMutex);
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Pause/resume draining for an address
+bool BusStatusMgr::setOfflineDrainPaused(BusElemAddrType address, bool paused)
+{
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(2)) != pdTRUE)
+        return false;
+    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    if (!pAddrStatus)
+    {
+        xSemaphoreGive(_busElemStatusMutex);
+        return false;
+    }
+    pAddrStatus->deviceStatus.setOfflineDrainPaused(paused);
+    xSemaphoreGive(_busElemStatusMutex);
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Reset offline buffer for an address
+bool BusStatusMgr::resetOfflineBuffer(BusElemAddrType address)
+{
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(2)) != pdTRUE)
+        return false;
+    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    if (!pAddrStatus)
+    {
+        xSemaphoreGive(_busElemStatusMutex);
+        return false;
+    }
+    pAddrStatus->deviceStatus.clearOfflineBuffer();
+    xSemaphoreGive(_busElemStatusMutex);
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Reconfigure offline buffer for an address
+bool BusStatusMgr::reconfigureOfflineBuffer(BusElemAddrType address, uint32_t maxEntries, uint32_t payloadSize,
+            uint32_t timestampBytes, uint32_t timestampResolutionUs)
+{
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+        return false;
+    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    if (!pAddrStatus)
+    {
+        xSemaphoreGive(_busElemStatusMutex);
+        return false;
+    }
+    pAddrStatus->deviceStatus.configureOfflineBuffer(maxEntries, payloadSize, timestampBytes, timestampResolutionUs);
+    xSemaphoreGive(_busElemStatusMutex);
+    return true;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -769,6 +951,37 @@ bool BusStatusMgr::setDevicePollInterval(BusElemAddrType address, uint32_t pollI
 
     xSemaphoreGive(_busElemStatusMutex);
     return updated;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Get current polling interval (us) for an address
+uint32_t BusStatusMgr::getDevicePollIntervalUs(BusElemAddrType address) const
+{
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(5)) != pdTRUE)
+        return 0;
+    uint32_t pollIntervalUs = 0;
+    const BusAddrStatus* pAddrStatus = findAddrStatusRecord(address);
+    if (pAddrStatus)
+        pollIntervalUs = pAddrStatus->deviceStatus.deviceIdentPolling.pollIntervalUs;
+    xSemaphoreGive(_busElemStatusMutex);
+    return pollIntervalUs;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Get polling info for an address
+bool BusStatusMgr::getDevicePollingInfo(BusElemAddrType address, DevicePollingInfo& pollInfoOut) const
+{
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(5)) != pdTRUE)
+        return false;
+    bool found = false;
+    const BusAddrStatus* pAddrStatus = findAddrStatusRecord(address);
+    if (pAddrStatus)
+    {
+        pollInfoOut = pAddrStatus->deviceStatus.deviceIdentPolling;
+        found = true;
+    }
+    xSemaphoreGive(_busElemStatusMutex);
+    return found;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////

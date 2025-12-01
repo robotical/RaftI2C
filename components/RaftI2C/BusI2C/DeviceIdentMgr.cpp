@@ -12,6 +12,12 @@
 #include "RaftDevice.h"
 #include "BusI2CAddrAndSlot.h"
 #include "Logger.h"
+#include "RaftJsonPrefixed.h"
+#include "OfflineDataStore.h"
+#include <algorithm>
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 
 // Info
 #define INFO_NEW_DEVICE_IDENTIFIED
@@ -30,6 +36,9 @@ DeviceIdentMgr::DeviceIdentMgr(BusStatusMgr& BusStatusMgr, BusReqSyncFn busReqSy
     _busStatusMgr(BusStatusMgr),
     _busReqSyncFn(busReqSyncFn)
 {
+    _offlineCtrlMutex = xSemaphoreCreateMutex();
+    _globalBufferPaused = true;
+    _globalDrainPaused = true;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -40,9 +49,940 @@ void DeviceIdentMgr::setup(const RaftJsonIF& config)
 {
     // Enabled
     _isEnabled = config.getBool("identEnable", true);
+    parseOfflineConfig(config);
 
     // Debug
-    LOG_I(MODULE_PREFIX, "DeviceIdentMgr setup %s", _isEnabled ? "enabled" : "disabled");
+    LOG_I(MODULE_PREFIX, "DeviceIdentMgr setup %s offlineBuf windowMs %d perDevBytes %d globalBytes %d maxPerPub %d", 
+                _isEnabled ? "enabled" : "disabled",
+                _offlinePolicy.defaultWindowMs, _offlinePolicy.perDeviceMaxBytes, _offlinePolicy.globalMaxBytes,
+                _offlinePolicy.maxPerPublish);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Parse offline buffer config from bus config
+void DeviceIdentMgr::parseOfflineConfig(const RaftJsonIF& config)
+{
+    RaftJsonPrefixed offlineCfg(config, "offlineBuffer");
+    _offlinePolicy.perDeviceMaxBytes = offlineCfg.getLong("perDeviceMaxBytes", 2048);
+    _offlinePolicy.globalMaxBytes = offlineCfg.getLong("globalMaxBytes", 16384);
+    _offlinePolicy.defaultWindowMs = offlineCfg.getLong("defaultWindowMs", 10000);
+    _offlinePolicy.minSamples = offlineCfg.getLong("minSamples", 4);
+    _offlinePolicy.maxPerPublish = offlineCfg.getLong("maxPerPublish", 32);
+    int32_t memUsePercent = offlineCfg.getLong("memUsePercent", -1);
+    if (memUsePercent >= 0)
+    {
+        uint32_t permille = (uint32_t)memUsePercent * 10;
+        if (permille > 1000)
+            permille = 1000;
+        _offlinePolicy.memUsePermille = permille;
+    }
+    _offlinePolicy.memUsePermille = offlineCfg.getLong("memUsePermille", _offlinePolicy.memUsePermille);
+
+    // Per device overrides
+    std::vector<String> devOverrides;
+    if (offlineCfg.getArrayElems("devices", devOverrides))
+    {
+        for (const String& devJson : devOverrides)
+        {
+            RaftJson devCfg(devJson);
+            String typeName = devCfg.getString("type", "");
+            uint32_t windowMs = devCfg.getLong("windowMs", 0);
+            if ((typeName.length() > 0) && (windowMs > 0))
+            {
+                _offlinePolicy.perDeviceWindowMs[std::string(typeName.c_str())] = windowMs;
+            }
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Calculate offline depth based on config and poll interval
+uint32_t DeviceIdentMgr::calcOfflineDepth(const DeviceTypeRecord& devTypeRec, const DevicePollingInfo& pollInfo) const
+{
+    uint32_t windowMs = _offlinePolicy.defaultWindowMs;
+    std::string devTypeName = devTypeRec.deviceType ? devTypeRec.deviceType : "";
+    auto windowIt = _offlinePolicy.perDeviceWindowMs.find(devTypeName);
+    if (windowIt != _offlinePolicy.perDeviceWindowMs.end())
+        windowMs = windowIt->second;
+
+    uint32_t intervalMs = pollInfo.pollIntervalUs / 1000;
+    uint32_t bytesPerEntry = pollInfo.pollResultSizeIncTimestamp + OfflineDataStore::META_STORAGE_BYTES;
+    uint32_t desired = (intervalMs > 0) ? (windowMs + intervalMs - 1) / intervalMs : _offlinePolicy.minSamples;
+    if (desired < _offlinePolicy.minSamples)
+        desired = _offlinePolicy.minSamples;
+
+    if (_offlinePolicy.perDeviceMaxBytes > 0 && bytesPerEntry > 0 && (_offlinePolicy.memUsePermille == 0))
+    {
+        uint32_t maxFromBytes = _offlinePolicy.perDeviceMaxBytes / bytesPerEntry;
+        if (maxFromBytes == 0)
+            desired = 1;
+        else if (maxFromBytes < desired)
+            desired = maxFromBytes;
+    }
+
+    // Try to scale up to use a share of available memory (75% default) across devices
+#ifdef ESP_PLATFORM
+    const uint32_t BUDGET_HEADROOM_BYTES = 1024 * 1024;
+    uint32_t currentBytes = _busStatusMgr.getOfflineBytesInUse();
+    uint64_t freeMem = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (freeMem == 0)
+        freeMem = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    uint64_t totalMemForBudget = freeMem + currentBytes;
+    if (totalMemForBudget > 0 && bytesPerEntry > 0)
+    {
+        uint64_t budgetBytes = currentBytes;
+        if (_offlinePolicy.memUsePermille > 0)
+            budgetBytes += (freeMem * _offlinePolicy.memUsePermille) / 1000;
+        else
+            budgetBytes += freeMem;
+        if ((_offlinePolicy.globalMaxBytes > 0) && (budgetBytes > _offlinePolicy.globalMaxBytes))
+            budgetBytes = _offlinePolicy.globalMaxBytes;
+        budgetBytes = (budgetBytes > BUDGET_HEADROOM_BYTES) ? (budgetBytes - BUDGET_HEADROOM_BYTES) : 0;
+
+        uint32_t numDevices = 1;
+        std::vector<BusElemAddrType> addrList;
+        _busStatusMgr.getBusElemAddresses(addrList, false);
+        if (!addrList.empty())
+            numDevices = addrList.size();
+
+        uint64_t perDeviceBudget = budgetBytes / numDevices;
+        uint32_t maxFromMem = perDeviceBudget / bytesPerEntry;
+        if (maxFromMem > desired)
+            desired = maxFromMem;
+        LOG_I(MODULE_PREFIX, "calcOfflineDepth freeMem %u currentBytes %u budget %u perDev %u bytesPerEntry %u desired %u",
+                (unsigned)freeMem, (unsigned)currentBytes, (unsigned)budgetBytes, (unsigned)perDeviceBudget,
+                (unsigned)bytesPerEntry, (unsigned)desired);
+    }
+#endif
+
+    return desired == 0 ? 1 : desired;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Apply global offline buffer limit
+uint32_t DeviceIdentMgr::applyGlobalOfflineLimit(const DevicePollingInfo& pollInfo, uint32_t requestedDepth) const
+{
+    const uint32_t BUDGET_HEADROOM_BYTES = 1024 * 1024;
+    if (requestedDepth == 0)
+        return 0;
+
+    uint32_t bytesPerEntry = pollInfo.pollResultSizeIncTimestamp + OfflineDataStore::META_STORAGE_BYTES;
+    if (bytesPerEntry == 0)
+        return requestedDepth;
+
+    // Current offline allocation already reserved
+    // Determine available memory to use (prefer PSRAM, fall back to internal)
+    uint64_t freeMem = 0;
+#ifdef ESP_PLATFORM
+    freeMem = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (freeMem == 0)
+        freeMem = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+#endif
+
+    // Apply safety fraction (permille) and optional global cap if configured
+    uint32_t currentBytes = _busStatusMgr.getOfflineBytesInUse();
+    uint32_t permille = _offlinePolicy.memUsePermille;
+    uint64_t budgetBytes = currentBytes;
+    if (permille > 0)
+        budgetBytes += (freeMem * permille) / 1000;
+    else
+        budgetBytes += freeMem;
+    if ((_offlinePolicy.globalMaxBytes > 0) && (budgetBytes > _offlinePolicy.globalMaxBytes))
+        budgetBytes = _offlinePolicy.globalMaxBytes;
+
+    // Keep some headroom so comms etc don't starve
+    budgetBytes = (budgetBytes > BUDGET_HEADROOM_BYTES) ? (budgetBytes - BUDGET_HEADROOM_BYTES) : 0;
+
+    // Split remaining budget equally across devices
+    uint64_t availableBytesTotal = budgetBytes;
+    uint32_t numDevices = 1;
+    {
+        std::vector<BusElemAddrType> addrList;
+        _busStatusMgr.getBusElemAddresses(addrList, false);
+        if (!addrList.empty())
+            numDevices = addrList.size();
+    }
+    uint64_t perDeviceBudget = availableBytesTotal / numDevices;
+    if ((_offlinePolicy.perDeviceMaxBytes > 0) && (perDeviceBudget > _offlinePolicy.perDeviceMaxBytes))
+        perDeviceBudget = _offlinePolicy.perDeviceMaxBytes;
+
+    uint32_t maxDepthFromMem = perDeviceBudget / bytesPerEntry;
+    if (maxDepthFromMem == 0)
+        return 0;
+
+    LOG_I(MODULE_PREFIX, "applyGlobalOfflineLimit freeMem %u currentBytes %u budget %u perDev %u bytesPerEntry %u req %u depth %u numDev %u",
+            (unsigned)freeMem, (unsigned)currentBytes, (unsigned)budgetBytes,
+            (unsigned)perDeviceBudget, (unsigned)bytesPerEntry, (unsigned)requestedDepth,
+            (unsigned)maxDepthFromMem, (unsigned)numDevices);
+
+    return (maxDepthFromMem < requestedDepth) ? maxDepthFromMem : requestedDepth;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Compute offline depth for an address using current policy
+uint32_t DeviceIdentMgr::computeDepthForAddress(BusElemAddrType address, const DevicePollingInfo& pollInfo) const
+{
+    uint16_t deviceTypeIdx = _busStatusMgr.getDeviceTypeIndexByAddr(address);
+    DeviceTypeRecord devTypeRec;
+    if (!deviceTypeRecords.getDeviceInfo(deviceTypeIdx, devTypeRec))
+        return 0;
+
+    uint32_t depthReq = calcOfflineDepth(devTypeRec, pollInfo);
+    uint32_t depth = applyGlobalOfflineLimit(pollInfo, depthReq);
+    if (depth == 0)
+        depth = 1;
+    return depth;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Get per-device publish limit
+uint32_t DeviceIdentMgr::getPerDevicePublishLimit(uint32_t maxResponsesToReturn) const
+{
+    if (maxResponsesToReturn)
+        return maxResponsesToReturn;
+    if (_maxPerPublishOverride)
+        return _maxPerPublishOverride;
+    return _offlinePolicy.maxPerPublish;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Check if offline drain is allowed for address/type
+bool DeviceIdentMgr::isOfflineDrainAllowed(BusElemAddrType address, uint16_t deviceTypeIndex) const
+{
+    std::string devTypeName;
+    DeviceTypeRecord devTypeRec;
+    if (deviceTypeRecords.getDeviceInfo(deviceTypeIndex, devTypeRec) && devTypeRec.deviceType)
+        devTypeName = devTypeRec.deviceType;
+
+    bool allowed = true;
+    if (_offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+    {
+        bool paused = _drainPausedAddrs.count(address) > 0;
+        bool restricted = _drainOnlySelected && (_drainSelectedAddrs.count(address) == 0) &&
+                    (devTypeName.empty() || (_drainSelectedTypes.count(devTypeName) == 0));
+        allowed = !(paused || restricted);
+        xSemaphoreGive(_offlineCtrlMutex);
+    }
+    return allowed;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Compute offline control flags for an address/type
+void DeviceIdentMgr::computeOfflineControlFlags(BusElemAddrType address, const std::string& devTypeName,
+            bool& bufferPaused, bool& drainPaused, bool& restrictToSelection) const
+{
+    bufferPaused = _globalBufferPaused;
+    drainPaused = _globalDrainPaused || _linkDrainPaused;
+    restrictToSelection = false;
+    if (_offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+    {
+        bufferPaused = bufferPaused || (_bufferPausedAddrs.count(address) > 0);
+        drainPaused = drainPaused || (_drainPausedAddrs.count(address) > 0) || _linkDrainPaused;
+        restrictToSelection = _drainOnlySelected && (_drainSelectedAddrs.count(address) == 0) &&
+                (devTypeName.empty() || (_drainSelectedTypes.count(devTypeName) == 0));
+        xSemaphoreGive(_offlineCtrlMutex);
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Apply paused/selection controls to a device record
+void DeviceIdentMgr::applyOfflineControlsToDevice(BusElemAddrType address, DeviceStatus& deviceStatus)
+{
+    std::string devTypeName;
+    DeviceTypeRecord devTypeRec;
+    if (deviceTypeRecords.getDeviceInfo(deviceStatus.getDeviceTypeIndex(), devTypeRec) && devTypeRec.deviceType)
+        devTypeName = devTypeRec.deviceType;
+
+    bool bufferPaused = false;
+    bool drainPaused = false;
+    bool restrictToSelection = false;
+    computeOfflineControlFlags(address, devTypeName, bufferPaused, drainPaused, restrictToSelection);
+
+    deviceStatus.setOfflineBufferPaused(bufferPaused);
+    deviceStatus.setOfflineDrainPaused(drainPaused || restrictToSelection);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Helper to set remaining counter
+void DeviceIdentMgr::setOfflineStatsRemaining(uint32_t remaining, uint32_t* pRemaining) const
+{
+    if (pRemaining)
+        *pRemaining += remaining;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Apply control flags to existing device status entries
+void DeviceIdentMgr::applyOfflineControlToAddress(BusElemAddrType address, uint16_t deviceTypeIdx)
+{
+    std::string devTypeName;
+    DeviceTypeRecord devTypeRec;
+    if (deviceTypeRecords.getDeviceInfo(deviceTypeIdx, devTypeRec) && devTypeRec.deviceType)
+        devTypeName = devTypeRec.deviceType;
+    bool bufferPaused = false;
+    bool drainPaused = false;
+    bool restrictToSelection = false;
+    computeOfflineControlFlags(address, devTypeName, bufferPaused, drainPaused, restrictToSelection);
+    _busStatusMgr.setOfflineBufferPaused(address, bufferPaused);
+    _busStatusMgr.setOfflineDrainPaused(address, drainPaused || restrictToSelection);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Apply control flags to all known devices
+void DeviceIdentMgr::applyOfflineControlToExisting()
+{
+    std::vector<BusElemAddrType> addresses;
+    _busStatusMgr.getBusElemAddresses(addresses, false);
+    for (auto address : addresses)
+    {
+        uint16_t deviceTypeIdx = _busStatusMgr.getDeviceTypeIndexByAddr(address);
+        applyOfflineControlToAddress(address, deviceTypeIdx);
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Apply poll rate override to a set of addresses
+bool DeviceIdentMgr::applyOfflineRateOverride(const std::vector<BusElemAddrType>& addresses, uint32_t pollRateMs)
+{
+    if (pollRateMs == 0)
+        return false;
+
+    std::vector<BusElemAddrType> targetAddrs = addresses;
+    if (targetAddrs.empty())
+        _busStatusMgr.getBusElemAddresses(targetAddrs, false);
+
+    bool anyUpdated = false;
+    for (auto addr : targetAddrs)
+    {
+        anyUpdated |= applyRateOverrideToAddress(addr, pollRateMs, true);
+    }
+    return anyUpdated;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Clear poll rate overrides for a set of addresses
+bool DeviceIdentMgr::clearOfflineRateOverride(const std::vector<BusElemAddrType>& addresses)
+{
+    std::vector<BusElemAddrType> targetAddrs = addresses;
+    if (targetAddrs.empty())
+        _busStatusMgr.getBusElemAddresses(targetAddrs, false);
+
+    bool anyCleared = false;
+    for (auto addr : targetAddrs)
+    {
+        anyCleared |= clearRateOverrideForAddress(addr);
+    }
+    return anyCleared;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Apply a poll rate override to a single address
+bool DeviceIdentMgr::applyRateOverrideToAddress(BusElemAddrType address, uint32_t pollRateMs, bool recordOriginal)
+{
+    if (pollRateMs == 0)
+        return false;
+
+    uint32_t rateMsClamped = pollRateMs;
+    if (rateMsClamped < 10)
+        rateMsClamped = 10;
+    if (rateMsClamped > 60000)
+        rateMsClamped = 60000;
+    uint32_t pollIntervalUs = rateMsClamped * 1000;
+
+    DevicePollingInfo pollInfo;
+    if (!_busStatusMgr.getDevicePollingInfo(address, pollInfo))
+        return false;
+
+    if (recordOriginal && _offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+    {
+        if (_rateOverrideOriginalUs.find(address) == _rateOverrideOriginalUs.end())
+            _rateOverrideOriginalUs[address] = pollInfo.pollIntervalUs;
+        _rateOverridesUs[address] = pollIntervalUs;
+        xSemaphoreGive(_offlineCtrlMutex);
+    }
+
+    pollInfo.pollIntervalUs = pollIntervalUs;
+    OfflineDataStats existingStats = _busStatusMgr.getOfflineStats(address);
+    uint32_t depth = existingStats.maxEntries > 0 ? existingStats.maxEntries : computeDepthForAddress(address, pollInfo);
+    bool updated = _busStatusMgr.setDevicePollInterval(address, pollIntervalUs);
+    LOG_I(MODULE_PREFIX, "offline rate override addr %s intervalUs %u depth %u payload %u",
+                BusI2CAddrAndSlot::toString(address).c_str(), pollInfo.pollIntervalUs, depth, pollInfo.pollResultSizeIncTimestamp);
+    if (depth > 0)
+    {
+        _busStatusMgr.reconfigureOfflineBuffer(address, depth, pollInfo.pollResultSizeIncTimestamp,
+                DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE, DevicePollingInfo::POLL_RESULT_RESOLUTION_US);
+    }
+    return updated;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Rebalance offline buffer depths across devices (shared budget split equally)
+bool DeviceIdentMgr::rebalanceOfflineBuffers(const std::vector<BusElemAddrType>& addresses)
+{
+    const uint32_t BUDGET_HEADROOM_BYTES = 1024 * 1024;
+    const uint64_t MIN_TARGET_PER_DEVICE_BYTES = (uint64_t)5 * 1024 * 1024;
+    bool explicitTargetsProvided = !addresses.empty();
+    // Determine target addresses
+    std::vector<BusElemAddrType> targetAddrs = addresses;
+    if (targetAddrs.empty())
+        _busStatusMgr.getBusElemAddresses(targetAddrs, false);
+    if (targetAddrs.empty())
+        return false;
+    LOG_I(MODULE_PREFIX, "rebalance start reqAddrs %u targetAddrs %u",
+            (unsigned)addresses.size(), (unsigned)targetAddrs.size());
+
+    // If a subset was requested, shrink non-target buffers to minimum to free memory
+    if (explicitTargetsProvided)
+    {
+        std::vector<BusElemAddrType> allAddrs;
+        _busStatusMgr.getBusElemAddresses(allAddrs, false);
+        for (auto addr : allAddrs)
+        {
+            if (std::find(targetAddrs.begin(), targetAddrs.end(), addr) != targetAddrs.end())
+                continue;
+            DevicePollingInfo pollInfo;
+            if (!_busStatusMgr.getDevicePollingInfo(addr, pollInfo))
+            {
+                LOG_W(MODULE_PREFIX, "rebalance shrink addr %s missing pollInfo",
+                        BusI2CAddrAndSlot::toString(addr).c_str());
+                continue;
+            }
+            uint32_t bytesPerEntry = pollInfo.pollResultSizeIncTimestamp + OfflineDataStore::META_STORAGE_BYTES;
+            uint32_t depth = _offlinePolicy.minSamples > 0 ? _offlinePolicy.minSamples : 1;
+            bool shrinkOk = _busStatusMgr.reconfigureOfflineBuffer(addr, depth,
+                    pollInfo.pollResultSizeIncTimestamp,
+                    DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE,
+                    DevicePollingInfo::POLL_RESULT_RESOLUTION_US);
+            LOG_I(MODULE_PREFIX, "rebalance shrink addr %s depth %u bytesPerEntry %u %s",
+                    BusI2CAddrAndSlot::toString(addr).c_str(), (unsigned)depth, (unsigned)bytesPerEntry,
+                    shrinkOk ? "ok" : "fail");
+        }
+    }
+
+    // Compute total budget bytes (75% default of free mem, capped by globalMaxBytes)
+    uint64_t freeMem = 0;
+#ifdef ESP_PLATFORM
+    freeMem = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (freeMem == 0)
+        freeMem = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+#endif
+    if (freeMem == 0 && _busStatusMgr.getOfflineBytesInUse() == 0)
+    {
+        LOG_W(MODULE_PREFIX, "rebalance skip freeMem 0 currentOffline 0 targets %u",
+                (unsigned)targetAddrs.size());
+        return false;
+    }
+
+    uint32_t currentBytes = 0;
+    for (auto addr : targetAddrs)
+    {
+        OfflineDataStats stats = _busStatusMgr.getOfflineStats(addr);
+        currentBytes += stats.maxEntries * (stats.payloadSize + stats.metaSize);
+    }
+
+    uint64_t budgetBytes = currentBytes;
+    if (_offlinePolicy.memUsePermille > 0)
+        budgetBytes += (freeMem * _offlinePolicy.memUsePermille) / 1000;
+    else
+        budgetBytes += freeMem;
+    if ((_offlinePolicy.globalMaxBytes > 0) && (budgetBytes > _offlinePolicy.globalMaxBytes))
+        budgetBytes = _offlinePolicy.globalMaxBytes;
+    // Leave headroom to avoid starving other subsystems
+    budgetBytes = (budgetBytes > BUDGET_HEADROOM_BYTES) ? (budgetBytes - BUDGET_HEADROOM_BYTES) : 0;
+    // Allow consuming some of the reserved headroom to reach the per-device floor when explicitly targeting
+    if (explicitTargetsProvided)
+    {
+        uint64_t minTotalBudget = MIN_TARGET_PER_DEVICE_BYTES * targetAddrs.size();
+        if ((budgetBytes < minTotalBudget) && ((budgetBytes + BUDGET_HEADROOM_BYTES) >= minTotalBudget))
+            budgetBytes = minTotalBudget;
+    }
+
+    // Split equally across targets, but when explicit targets provided ensure a high floor
+    uint64_t perDeviceBudget = budgetBytes / targetAddrs.size();
+    if (explicitTargetsProvided)
+    {
+        uint64_t minTotalBudget = MIN_TARGET_PER_DEVICE_BYTES * targetAddrs.size();
+        if ((budgetBytes >= minTotalBudget) && (perDeviceBudget < MIN_TARGET_PER_DEVICE_BYTES))
+        {
+            perDeviceBudget = MIN_TARGET_PER_DEVICE_BYTES;
+        }
+        else if (perDeviceBudget < MIN_TARGET_PER_DEVICE_BYTES)
+        {
+            LOG_W(MODULE_PREFIX, "rebalance cap perDev floor due to budget budgetBytes %u targets %u minPerDev %u",
+                    (unsigned)budgetBytes, (unsigned)targetAddrs.size(), (unsigned)MIN_TARGET_PER_DEVICE_BYTES);
+        }
+    }
+    if ((_offlinePolicy.perDeviceMaxBytes > 0) && (perDeviceBudget > _offlinePolicy.perDeviceMaxBytes))
+        perDeviceBudget = _offlinePolicy.perDeviceMaxBytes;
+
+    bool anyUpdated = false;
+    for (auto addr : targetAddrs)
+    {
+        DevicePollingInfo pollInfo;
+        if (!_busStatusMgr.getDevicePollingInfo(addr, pollInfo))
+        {
+            LOG_W(MODULE_PREFIX, "rebalance addr %s missing pollInfo targets %u",
+                    BusI2CAddrAndSlot::toString(addr).c_str(), (unsigned)targetAddrs.size());
+            continue;
+        }
+        uint32_t bytesPerEntry = pollInfo.pollResultSizeIncTimestamp + OfflineDataStore::META_STORAGE_BYTES;
+        if (bytesPerEntry == 0)
+        {
+            LOG_W(MODULE_PREFIX, "rebalance addr %s bytesPerEntry 0 payload %u tsBytes %u",
+                    BusI2CAddrAndSlot::toString(addr).c_str(),
+                    (unsigned)pollInfo.pollResultSizeIncTimestamp,
+                    (unsigned)DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE);
+            continue;
+        }
+        OfflineDataStats stats = _busStatusMgr.getOfflineStats(addr);
+        uint64_t currentAllocBytes = (uint64_t)stats.maxEntries * (stats.payloadSize + stats.metaSize);
+        uint64_t targetBudget = perDeviceBudget;
+        if (currentAllocBytes > targetBudget)
+            targetBudget = currentAllocBytes;
+#ifdef ESP_PLATFORM
+        uint64_t freeMemNow = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        if (freeMemNow == 0)
+            freeMemNow = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        uint64_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        if (largestBlock == 0)
+            largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+#else
+        uint64_t freeMemNow = 0;
+        uint64_t largestBlock = 0;
+#endif
+        uint32_t depth = targetBudget / bytesPerEntry;
+        if (depth == 0)
+            depth = _offlinePolicy.minSamples > 0 ? _offlinePolicy.minSamples : 1;
+        uint32_t maxDepthFromBlocks = depth;
+#ifdef ESP_PLATFORM
+        if (largestBlock > 0)
+        {
+            uint32_t maxDepthFromRing = pollInfo.pollResultSizeIncTimestamp ?
+                        (uint32_t)(largestBlock / pollInfo.pollResultSizeIncTimestamp) : depth;
+            uint32_t maxDepthFromMeta = OfflineDataStore::META_STORAGE_BYTES ?
+                        (uint32_t)(largestBlock / OfflineDataStore::META_STORAGE_BYTES) : depth;
+            maxDepthFromBlocks = std::min(maxDepthFromRing, maxDepthFromMeta);
+            uint32_t maxDepthFromFree = bytesPerEntry ?
+                        (uint32_t)((largestBlock > freeMemNow ? largestBlock : freeMemNow) / bytesPerEntry) : depth;
+            if (maxDepthFromFree < maxDepthFromBlocks)
+                maxDepthFromBlocks = maxDepthFromFree;
+        }
+#endif
+        if (maxDepthFromBlocks > 0 && depth > maxDepthFromBlocks)
+        {
+            LOG_W(MODULE_PREFIX, "rebalance clamp depth addr %s depthReq %u depthMax %u freeNow %u largestBlock %u",
+                    BusI2CAddrAndSlot::toString(addr).c_str(), (unsigned)depth,
+                    (unsigned)maxDepthFromBlocks, (unsigned)freeMemNow, (unsigned)largestBlock);
+            depth = maxDepthFromBlocks;
+        }
+        bool updated = _busStatusMgr.reconfigureOfflineBuffer(addr, depth,
+                pollInfo.pollResultSizeIncTimestamp,
+                DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE,
+                DevicePollingInfo::POLL_RESULT_RESOLUTION_US);
+        LOG_I(MODULE_PREFIX, "rebalance addr %s freeMem %u freeNow %u largest %u currentBytes %u budget %u headroom %u perDev %u bytesPerEntry %u depth %u targets %u updated %d",
+                BusI2CAddrAndSlot::toString(addr).c_str(), (unsigned)freeMem, (unsigned)freeMemNow,
+                (unsigned)largestBlock, (unsigned)currentBytes,
+                (unsigned)budgetBytes, (unsigned)BUDGET_HEADROOM_BYTES, (unsigned)perDeviceBudget,
+                (unsigned)bytesPerEntry, (unsigned)depth, (unsigned)targetAddrs.size(), (int)updated);
+        anyUpdated |= updated;
+    }
+    return anyUpdated;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Clear a poll rate override for a single address
+bool DeviceIdentMgr::clearRateOverrideForAddress(BusElemAddrType address)
+{
+    uint32_t originalIntervalUs = 0;
+    bool hadOverride = false;
+    if (_offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+    {
+        auto it = _rateOverrideOriginalUs.find(address);
+        if (it != _rateOverrideOriginalUs.end())
+        {
+            originalIntervalUs = it->second;
+            _rateOverrideOriginalUs.erase(it);
+            _rateOverridesUs.erase(address);
+            hadOverride = true;
+        }
+        xSemaphoreGive(_offlineCtrlMutex);
+    }
+    if (!hadOverride)
+        return false;
+
+    DevicePollingInfo pollInfo;
+    if (!_busStatusMgr.getDevicePollingInfo(address, pollInfo))
+        return false;
+
+    if (originalIntervalUs == 0)
+        originalIntervalUs = pollInfo.pollIntervalUs;
+
+    pollInfo.pollIntervalUs = originalIntervalUs;
+    return _busStatusMgr.setDevicePollInterval(address, pollInfo.pollIntervalUs);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Override per publish offline limit
+void DeviceIdentMgr::setOfflineMaxPerPublishOverride(uint32_t maxPerPublish)
+{
+    _maxPerPublishOverride = maxPerPublish;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Set drain selection
+void DeviceIdentMgr::setOfflineDrainSelection(const std::vector<BusElemAddrType>& addresses, const std::vector<std::string>& typeNames,
+            bool drainOnlySelected)
+{
+    if (_offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+    {
+        _drainSelectedAddrs.clear();
+        _drainSelectedTypes.clear();
+        for (auto addr : addresses)
+            _drainSelectedAddrs.insert(addr);
+        for (const auto& typeName : typeNames)
+        {
+            if (!typeName.empty())
+                _drainSelectedTypes.insert(typeName);
+        }
+        bool hasSelection = !_drainSelectedAddrs.empty() || !_drainSelectedTypes.empty();
+        _drainOnlySelected = drainOnlySelected || hasSelection;
+        // Selection alone should not auto-resume buffering/draining
+        xSemaphoreGive(_offlineCtrlMutex);
+    }
+    applyOfflineControlToExisting();
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Pause/resume buffering for addresses
+void DeviceIdentMgr::setOfflineBufferPaused(const std::vector<BusElemAddrType>& addresses, bool paused)
+{
+    if (_offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+    {
+        if (addresses.empty())
+        {
+            _globalBufferPaused = paused;
+            if (!paused)
+                _bufferPausedAddrs.clear();
+        }
+        else
+        {
+            for (auto addr : addresses)
+            {
+                if (paused)
+                    _bufferPausedAddrs.insert(addr);
+                else
+                    _bufferPausedAddrs.erase(addr);
+            }
+        }
+        xSemaphoreGive(_offlineCtrlMutex);
+    }
+
+    if (addresses.empty())
+        applyOfflineControlToExisting();
+    else
+    {
+        for (auto addr : addresses)
+        {
+            uint16_t deviceTypeIdx = _busStatusMgr.getDeviceTypeIndexByAddr(addr);
+            applyOfflineControlToAddress(addr, deviceTypeIdx);
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Estimate offline allocation bytes for addresses without applying changes
+bool DeviceIdentMgr::estimateOfflineAllocations(const std::vector<BusElemAddrType>& addresses,
+            std::map<BusElemAddrType, EstAllocInfo>& allocBytesOut) const
+{
+    allocBytesOut.clear();
+    const uint32_t BUDGET_HEADROOM_BYTES = 1024 * 1024;
+    const uint64_t MIN_TARGET_PER_DEVICE_BYTES = (uint64_t)5 * 1024 * 1024;
+    bool explicitTargetsProvided = !addresses.empty();
+    std::vector<BusElemAddrType> targetAddrs = addresses;
+    if (targetAddrs.empty())
+        _busStatusMgr.getBusElemAddresses(targetAddrs, false);
+    if (targetAddrs.empty())
+        return false;
+
+    uint64_t freeMem = 0;
+    uint64_t largestBlock = 0;
+#ifdef ESP_PLATFORM
+    freeMem = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (freeMem == 0)
+        freeMem = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    if (largestBlock == 0)
+        largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+#endif
+    if (freeMem == 0 && _busStatusMgr.getOfflineBytesInUse() == 0)
+        return false;
+
+    // Track current allocation and provisional sizing (mirrors start path which applies rate override then rebalances)
+    std::map<BusElemAddrType, uint64_t> simCurrentAllocBytes;
+    uint32_t currentBytes = 0;
+    uint64_t provisionalConsumed = 0;
+    for (auto addr : targetAddrs)
+    {
+        OfflineDataStats stats = _busStatusMgr.getOfflineStats(addr);
+        DevicePollingInfo pollInfo;
+        if (!_busStatusMgr.getDevicePollingInfo(addr, pollInfo))
+            continue;
+        uint32_t bytesPerEntry = pollInfo.pollResultSizeIncTimestamp + OfflineDataStore::META_STORAGE_BYTES;
+        if (bytesPerEntry == 0)
+            continue;
+        uint64_t allocBytes = (uint64_t)stats.maxEntries * (stats.payloadSize + stats.metaSize);
+        // Provisional allocation similar to rate override path (calc depth before rebalance)
+        uint32_t provisionalDepth = computeDepthForAddress(addr, pollInfo);
+        if (provisionalDepth == 0)
+            provisionalDepth = _offlinePolicy.minSamples > 0 ? _offlinePolicy.minSamples : 1;
+        uint64_t provisionalAlloc = (uint64_t)provisionalDepth * bytesPerEntry;
+        if (provisionalAlloc > allocBytes)
+        {
+            provisionalConsumed += provisionalAlloc - allocBytes;
+            allocBytes = provisionalAlloc;
+        }
+        simCurrentAllocBytes[addr] = allocBytes;
+        currentBytes += (uint32_t)std::min<uint64_t>(allocBytes, UINT32_MAX);
+    }
+
+    // Approximate free memory after provisional allocation (as happens during rate override)
+    uint64_t freeMemSim = freeMem;
+    uint64_t largestBlockSim = largestBlock;
+    if (provisionalConsumed > 0)
+    {
+        freeMemSim = freeMemSim > provisionalConsumed ? (freeMemSim - provisionalConsumed) : 0;
+        largestBlockSim = largestBlockSim > provisionalConsumed ? (largestBlockSim - provisionalConsumed) : freeMemSim;
+    }
+    if (largestBlockSim > freeMemSim)
+        largestBlockSim = freeMemSim;
+
+    uint64_t budgetBytes = currentBytes;
+    if (_offlinePolicy.memUsePermille > 0)
+        budgetBytes += (freeMemSim * _offlinePolicy.memUsePermille) / 1000;
+    else
+        budgetBytes += freeMemSim;
+    if ((_offlinePolicy.globalMaxBytes > 0) && (budgetBytes > _offlinePolicy.globalMaxBytes))
+        budgetBytes = _offlinePolicy.globalMaxBytes;
+    budgetBytes = (budgetBytes > BUDGET_HEADROOM_BYTES) ? (budgetBytes - BUDGET_HEADROOM_BYTES) : 0;
+    if (explicitTargetsProvided)
+    {
+        uint64_t minTotalBudget = MIN_TARGET_PER_DEVICE_BYTES * targetAddrs.size();
+        if ((budgetBytes < minTotalBudget) && ((budgetBytes + BUDGET_HEADROOM_BYTES) >= minTotalBudget))
+            budgetBytes = minTotalBudget;
+    }
+    uint64_t perDeviceBudget = targetAddrs.empty() ? 0 : budgetBytes / targetAddrs.size();
+    if (explicitTargetsProvided)
+    {
+        if ((budgetBytes >= MIN_TARGET_PER_DEVICE_BYTES * targetAddrs.size()) && (perDeviceBudget < MIN_TARGET_PER_DEVICE_BYTES))
+            perDeviceBudget = MIN_TARGET_PER_DEVICE_BYTES;
+    }
+    if ((_offlinePolicy.perDeviceMaxBytes > 0) && (perDeviceBudget > _offlinePolicy.perDeviceMaxBytes))
+        perDeviceBudget = _offlinePolicy.perDeviceMaxBytes;
+
+    uint64_t freeMemRemaining = freeMemSim;
+    uint64_t largestBlockRemaining = largestBlockSim;
+    if (largestBlockRemaining > freeMemRemaining)
+        largestBlockRemaining = freeMemRemaining;
+
+    for (auto addr : targetAddrs)
+    {
+        DevicePollingInfo pollInfo;
+        if (!_busStatusMgr.getDevicePollingInfo(addr, pollInfo))
+            continue;
+        uint32_t bytesPerEntry = pollInfo.pollResultSizeIncTimestamp + OfflineDataStore::META_STORAGE_BYTES;
+        if (bytesPerEntry == 0)
+            continue;
+        OfflineDataStats stats = _busStatusMgr.getOfflineStats(addr);
+        uint64_t currentAllocBytes = simCurrentAllocBytes.count(addr) ?
+                    simCurrentAllocBytes[addr] :
+                    (uint64_t)stats.maxEntries * (stats.payloadSize + stats.metaSize);
+        uint64_t targetBudget = perDeviceBudget;
+        if (currentAllocBytes > targetBudget)
+            targetBudget = currentAllocBytes;
+#ifdef ESP_PLATFORM
+        uint32_t depth = bytesPerEntry ? (uint32_t)(targetBudget / bytesPerEntry) : 0;
+        if (depth == 0)
+            depth = _offlinePolicy.minSamples > 0 ? _offlinePolicy.minSamples : 1;
+        uint32_t maxDepthFromBlocks = depth;
+        if (largestBlockRemaining > 0)
+        {
+            uint32_t maxDepthFromRing = pollInfo.pollResultSizeIncTimestamp ?
+                    (uint32_t)(largestBlockRemaining / pollInfo.pollResultSizeIncTimestamp) : depth;
+            uint32_t maxDepthFromMeta = OfflineDataStore::META_STORAGE_BYTES ?
+                    (uint32_t)(largestBlockRemaining / OfflineDataStore::META_STORAGE_BYTES) : depth;
+            maxDepthFromBlocks = std::min(maxDepthFromRing, maxDepthFromMeta);
+            uint64_t freeOrLargest = (largestBlockRemaining > freeMemRemaining) ? largestBlockRemaining : freeMemRemaining;
+            uint32_t maxDepthFromFree = bytesPerEntry ? (uint32_t)(freeOrLargest / bytesPerEntry) : depth;
+            if (maxDepthFromFree < maxDepthFromBlocks)
+                maxDepthFromBlocks = maxDepthFromFree;
+        }
+        if (maxDepthFromBlocks > 0 && depth > maxDepthFromBlocks)
+            depth = maxDepthFromBlocks;
+#else
+        uint32_t depth = bytesPerEntry ? (uint32_t)(targetBudget / bytesPerEntry) : 0;
+        if (depth == 0)
+            depth = _offlinePolicy.minSamples > 0 ? _offlinePolicy.minSamples : 1;
+#endif
+        // Never report an estimate below the current allocation (already reserved)
+        uint32_t currentDepth = bytesPerEntry ? (uint32_t)(currentAllocBytes / bytesPerEntry) : 0;
+        if ((currentDepth > 0) && (currentDepth > depth))
+            depth = currentDepth;
+        uint64_t allocBytes = (uint64_t)depth * bytesPerEntry;
+        EstAllocInfo info;
+        info.allocBytes = allocBytes > UINT32_MAX ? UINT32_MAX : (uint32_t)allocBytes;
+        info.bytesPerEntry = bytesPerEntry;
+        info.payloadSize = pollInfo.pollResultSizeIncTimestamp;
+        info.metaSize = OfflineDataStore::META_STORAGE_BYTES;
+        allocBytesOut[addr] = info;
+
+        // Simulate memory consumption so later targets see reduced free space
+        if (allocBytes >= currentAllocBytes)
+        {
+            uint64_t delta = allocBytes - currentAllocBytes;
+            freeMemRemaining = freeMemRemaining > delta ? (freeMemRemaining - delta) : 0;
+            uint64_t largestConsume = std::max((uint64_t)depth * pollInfo.pollResultSizeIncTimestamp,
+                        (uint64_t)depth * OfflineDataStore::META_STORAGE_BYTES);
+            largestBlockRemaining = largestBlockRemaining > largestConsume ? (largestBlockRemaining - largestConsume) : freeMemRemaining;
+        }
+        else
+        {
+            uint64_t delta = currentAllocBytes - allocBytes;
+            freeMemRemaining += delta;
+            largestBlockRemaining += delta;
+        }
+        if (largestBlockRemaining > freeMemRemaining)
+            largestBlockRemaining = freeMemRemaining;
+    }
+    return !allocBytesOut.empty();
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Pause/resume draining for addresses
+void DeviceIdentMgr::setOfflineDrainPaused(const std::vector<BusElemAddrType>& addresses, bool paused)
+{
+    if (_offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+    {
+        if (addresses.empty())
+        {
+            _globalDrainPaused = paused;
+            if (!paused)
+                _drainPausedAddrs.clear();
+        }
+        else
+        {
+            for (auto addr : addresses)
+            {
+                if (paused)
+                    _drainPausedAddrs.insert(addr);
+                else
+                    _drainPausedAddrs.erase(addr);
+            }
+        }
+        xSemaphoreGive(_offlineCtrlMutex);
+    }
+
+    if (addresses.empty())
+        applyOfflineControlToExisting();
+    else
+    {
+        for (auto addr : addresses)
+        {
+            uint16_t deviceTypeIdx = _busStatusMgr.getDeviceTypeIndexByAddr(addr);
+            applyOfflineControlToAddress(addr, deviceTypeIdx);
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Pause/resume draining based on link availability
+void DeviceIdentMgr::setOfflineDrainLinkPaused(bool paused)
+{
+    bool changed = false;
+    if (_offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+    {
+        if (_linkDrainPaused != paused)
+        {
+            _linkDrainPaused = paused;
+            changed = true;
+        }
+        xSemaphoreGive(_offlineCtrlMutex);
+    }
+    else if (_linkDrainPaused != paused)
+    {
+        _linkDrainPaused = paused;
+        changed = true;
+    }
+
+    if (changed)
+        applyOfflineControlToExisting();
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Reset offline buffers for addresses
+void DeviceIdentMgr::resetOfflineBuffers(const std::vector<BusElemAddrType>& addresses)
+{
+    std::vector<BusElemAddrType> targetAddrs = addresses;
+    if (targetAddrs.empty())
+        _busStatusMgr.getBusElemAddresses(targetAddrs, false);
+
+    for (auto addr : targetAddrs)
+    {
+        _busStatusMgr.resetOfflineBuffer(addr);
+        DevicePollingInfo pollInfo;
+        if (_busStatusMgr.getDevicePollingInfo(addr, pollInfo))
+        {
+            // Unconfigure buffer to release allocation; reconfigured on start
+            _busStatusMgr.reconfigureOfflineBuffer(addr, 0,
+                    pollInfo.pollResultSizeIncTimestamp,
+                    DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE,
+                    DevicePollingInfo::POLL_RESULT_RESOLUTION_US);
+            LOG_I(MODULE_PREFIX, "resetOfflineBuffers addr %s unconfigured",
+                    BusI2CAddrAndSlot::toString(addr).c_str());
+        }
+        // Ensure buffering/draining stays paused after reset
+        _busStatusMgr.setOfflineBufferPaused(addr, true);
+        _busStatusMgr.setOfflineDrainPaused(addr, true);
+        if (_offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+        {
+            _bufferPausedAddrs.insert(addr);
+            _drainPausedAddrs.insert(addr);
+            xSemaphoreGive(_offlineCtrlMutex);
+        }
+    }
+
+    applyOfflineControlToExisting();
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Snapshot control state for diagnostics
+void DeviceIdentMgr::getOfflineControlSnapshot(std::set<BusElemAddrType>& bufferPaused, std::set<BusElemAddrType>& drainPaused,
+            std::set<BusElemAddrType>& drainSelectedAddrs, std::set<std::string>& drainSelectedTypes,
+            bool& drainOnlySelected, uint32_t& maxPerPublishOverride,
+            bool& globalBufferPaused, bool& globalDrainPaused,
+            std::map<BusElemAddrType, uint32_t>& rateOverridesUs) const
+{
+    bufferPaused.clear();
+    drainPaused.clear();
+    drainSelectedAddrs.clear();
+    drainSelectedTypes.clear();
+    drainOnlySelected = _drainOnlySelected;
+    maxPerPublishOverride = _maxPerPublishOverride;
+    globalBufferPaused = _globalBufferPaused;
+    globalDrainPaused = _globalDrainPaused || _linkDrainPaused;
+    rateOverridesUs.clear();
+
+    if (_offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
+    {
+        bufferPaused = _bufferPausedAddrs;
+        drainPaused = _drainPausedAddrs;
+        drainSelectedAddrs = _drainSelectedAddrs;
+        drainSelectedTypes = _drainSelectedTypes;
+        drainOnlySelected = _drainOnlySelected;
+        maxPerPublishOverride = _maxPerPublishOverride;
+        globalBufferPaused = _globalBufferPaused;
+        globalDrainPaused = _globalDrainPaused || _linkDrainPaused;
+        rateOverridesUs = _rateOverridesUs;
+        xSemaphoreGive(_offlineCtrlMutex);
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -53,6 +993,19 @@ void DeviceIdentMgr::getDeviceAddresses(std::vector<BusElemAddrType>& addresses,
 {
     // Get list of all bus element addresses
     _busStatusMgr.getBusElemAddresses(addresses, onlyAddressesWithIdentPollResponses);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Get device type name for an address
+bool DeviceIdentMgr::getDeviceTypeName(BusElemAddrType address, std::string& typeName) const
+{
+    typeName.clear();
+    uint16_t deviceTypeIdx = _busStatusMgr.getDeviceTypeIndexByAddr(address);
+    DeviceTypeRecord devTypeRec;
+    if (!deviceTypeRecords.getDeviceInfo(deviceTypeIdx, devTypeRec) || !devTypeRec.deviceType)
+        return false;
+    typeName = devTypeRec.deviceType;
+    return true;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -116,6 +1069,10 @@ void DeviceIdentMgr::identifyDevice(BusElemAddrType address, DeviceStatus& devic
             // Set polling results size
             deviceStatus.dataAggregator.init(deviceStatus.deviceIdentPolling.numPollResultsToStore, 
                     deviceStatus.deviceIdentPolling.pollResultSizeIncTimestamp);
+
+            // Defer offline buffer allocation until an explicit offlinebuf start command
+            deviceStatus.setOfflineBufferPaused(true);
+            applyOfflineControlsToDevice(address, deviceStatus);
 
 #ifdef DEBUG_HANDLE_BUS_DEVICE_INFO
             LOG_I(MODULE_PREFIX, "setBusElemDevInfo address %s numPollResToStore %d pollResSizeIncTimestamp %d", 
@@ -283,7 +1240,9 @@ bool DeviceIdentMgr::processDeviceInit(BusElemAddrType address, const DeviceType
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 String DeviceIdentMgr::deviceStatusToJson(BusElemAddrType address, bool isOnline, uint16_t deviceTypeIndex, 
-                const std::vector<uint8_t>& devicePollResponseData, uint32_t responseSize) const
+                const std::vector<uint8_t>& devicePollResponseData, uint32_t responseSize,
+                bool isBacklog, uint32_t remainingCount, const OfflineDataMeta* pFirstMeta,
+                const OfflineDataStats& stats) const
 {
     // Get device type info
     DeviceTypeRecord devTypeRec;
@@ -291,7 +1250,20 @@ String DeviceIdentMgr::deviceStatusToJson(BusElemAddrType address, bool isOnline
         return "";
 
     // Get the poll response JSON
-    return deviceTypeRecords.deviceStatusToJson(address, isOnline, &devTypeRec, devicePollResponseData);
+    String jsonOut = deviceTypeRecords.deviceStatusToJson(address, isOnline, &devTypeRec, devicePollResponseData,
+                isBacklog, remainingCount, pFirstMeta, &stats);
+    if (isBacklog)
+    {
+        String snippet = jsonOut;
+        if (snippet.length() > 120)
+            snippet = snippet.substring(0, 120);
+        LOG_I(MODULE_PREFIX, "offline backlog json addr 0x%x type %s remain %u json %s...",
+                (unsigned)address,
+                devTypeRec.deviceType ? devTypeRec.deviceType : "unknown",
+                (unsigned)remainingCount,
+                snippet.c_str());
+    }
+    return jsonOut;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -331,12 +1303,62 @@ String DeviceIdentMgr::getDevTypeInfoJsonByTypeIdx(uint16_t deviceTypeIdx, bool 
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Peek offline data without consuming
+String DeviceIdentMgr::peekOfflineDataJson(const std::vector<BusElemAddrType>& addresses,
+            uint32_t startIdx, uint32_t maxResponsesToReturn, uint32_t maxBytes,
+            uint32_t& totalRemaining) const
+{
+    String jsonStr;
+    totalRemaining = 0;
+
+    std::vector<BusElemAddrType> targetAddrs = addresses;
+    if (targetAddrs.empty())
+        _busStatusMgr.getBusElemAddresses(targetAddrs, false);
+
+    uint32_t maxBytesPerDevice = maxBytes;
+    if (maxBytesPerDevice == 0)
+        maxBytesPerDevice = _offlinePolicy.perDeviceMaxBytes ? _offlinePolicy.perDeviceMaxBytes : 2048;
+
+    for (auto address : targetAddrs)
+    {
+        bool isOnline = false;
+        uint16_t deviceTypeIndex = 0;
+        std::vector<uint8_t> devicePollResponseData;
+        uint32_t responseSize = 0;
+        std::vector<OfflineDataMeta> metas;
+        OfflineDataStats stats;
+
+        uint32_t numResponses = _busStatusMgr.peekBusElemOfflineResponses(address, isOnline, deviceTypeIndex,
+                    devicePollResponseData, responseSize, startIdx, maxResponsesToReturn, maxBytesPerDevice, metas, stats);
+
+        uint32_t remaining = (stats.depth > (startIdx + numResponses)) ? (stats.depth - (startIdx + numResponses)) : 0;
+        if (stats.depth > startIdx)
+            totalRemaining += stats.depth - startIdx;
+
+        if ((numResponses == 0) && (remaining == 0))
+            continue;
+
+        String jsonData = deviceStatusToJson(address,
+                        isOnline, deviceTypeIndex, devicePollResponseData, responseSize,
+                        true, remaining, metas.size() > 0 ? &metas.front() : nullptr, stats);
+        if (jsonData.length() > 0)
+        {
+            jsonStr += (jsonStr.length() == 0 ? "{" : ",") + jsonData;
+        }
+    }
+
+    return jsonStr.length() == 0 ? "{}" : jsonStr + "}";
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// @brief Get queued device data in JSON format
 /// @return JSON doc
-String DeviceIdentMgr::getQueuedDeviceDataJson() const
+String DeviceIdentMgr::getQueuedDeviceDataJson(uint32_t maxResponsesToReturn, uint32_t* pRemaining) const
 {
     // Return string
     String jsonStr;
+    uint32_t remainingTotal = 0;
+    uint32_t perDeviceLimit = getPerDevicePublishLimit(maxResponsesToReturn);
 
     // Get list of all bus element addresses
     std::vector<BusElemAddrType> addresses;
@@ -345,19 +1367,62 @@ String DeviceIdentMgr::getQueuedDeviceDataJson() const
     {
         // Get bus status for each address
         bool isOnline = false;
-        uint16_t deviceTypeIndex = 0;
+        uint16_t deviceTypeIndex = _busStatusMgr.getDeviceTypeIndexByAddr(address);
+        DeviceTypeRecord devTypeRec;
+        const char* devTypeName = nullptr;
+        if (deviceTypeRecords.getDeviceInfo(deviceTypeIndex, devTypeRec))
+            devTypeName = devTypeRec.deviceType;
         std::vector<uint8_t> devicePollResponseData;
         uint32_t responseSize = 0;
-        _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, devicePollResponseData, responseSize, 0);
+        std::vector<OfflineDataMeta> metas;
+        OfflineDataStats stats;
+        bool isBacklog = false;
+        uint32_t numResponses = 0;
+
+        // Drain offline backlog if allowed
+        bool drainAllowed = isOfflineDrainAllowed(address, deviceTypeIndex);
+        if (drainAllowed)
+        {
+            numResponses = _busStatusMgr.getBusElemOfflineResponses(address, isOnline, deviceTypeIndex, 
+                        devicePollResponseData, responseSize, perDeviceLimit, metas, stats);
+            isBacklog = numResponses > 0;
+            remainingTotal += stats.depth;
+            if (numResponses == 0)
+            {
+                numResponses = _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, 
+                            devicePollResponseData, responseSize, perDeviceLimit);
+            }
+        }
+        else
+        {
+            // Drain suppressed - still report remaining depth for backlog hints
+            stats = _busStatusMgr.getOfflineStats(address);
+            remainingTotal += stats.depth;
+            numResponses = _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, 
+                        devicePollResponseData, responseSize, perDeviceLimit);
+        }
+
+        if ((stats.depth > 0) || (numResponses > 0) || !drainAllowed)
+        {
+            // LOG_I(MODULE_PREFIX, "offlinebuf publish addr 0x%x type %s drainAllowed %d backlogDepth %u responses %u remainTotal %u",
+            //         (unsigned)address,
+            //         devTypeName ? devTypeName : "unknown",
+            //         drainAllowed,
+            //         (unsigned)stats.depth,
+            //         (unsigned)numResponses,
+            //         (unsigned)remainingTotal);
+        }
 
         // Use device identity manager to convert to JSON
         String jsonData = deviceStatusToJson(address, 
-                        isOnline, deviceTypeIndex, devicePollResponseData, responseSize);
+                        isOnline, deviceTypeIndex, devicePollResponseData, responseSize,
+                        isBacklog, stats.depth, metas.size() > 0 ? &metas.front() : nullptr, stats);
         if (jsonData.length() > 0)
         {
             jsonStr += (jsonStr.length() == 0 ? "{" : ",") + jsonData;
         }
     }
+    setOfflineStatsRemaining(remainingTotal, pRemaining);
     return jsonStr.length() == 0 ? "{}" : jsonStr + "}";
 }
 
@@ -365,10 +1430,13 @@ String DeviceIdentMgr::getQueuedDeviceDataJson() const
 /// @brief Get queued device data in binary format
 /// @param connMode connection mode (inc bus number)
 /// @return Binary data vector
-std::vector<uint8_t> DeviceIdentMgr::getQueuedDeviceDataBinary(uint32_t connMode) const
+std::vector<uint8_t> DeviceIdentMgr::getQueuedDeviceDataBinary(uint32_t connMode, uint32_t maxResponsesToReturn,
+            uint32_t* pRemaining) const
 {
     // Return buffer
     std::vector<uint8_t> binData;
+    uint32_t remainingTotal = 0;
+    uint32_t perDeviceLimit = getPerDevicePublishLimit(maxResponsesToReturn);
 
     // Get list of all bus element addresses
     std::vector<BusElemAddrType> addresses;
@@ -377,10 +1445,29 @@ std::vector<uint8_t> DeviceIdentMgr::getQueuedDeviceDataBinary(uint32_t connMode
     {
         // Get bus status for each address
         bool isOnline = false;
-        uint16_t deviceTypeIndex = 0;
+        uint16_t deviceTypeIndex = _busStatusMgr.getDeviceTypeIndexByAddr(address);
         std::vector<uint8_t> devicePollResponseData;
         uint32_t responseSize = 0;
-        _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, devicePollResponseData, responseSize, 0);
+        std::vector<OfflineDataMeta> metas;
+        OfflineDataStats stats;
+        uint32_t numResponses = 0;
+
+        if (isOfflineDrainAllowed(address, deviceTypeIndex))
+        {
+            numResponses = _busStatusMgr.getBusElemOfflineResponses(address, isOnline, deviceTypeIndex, 
+                        devicePollResponseData, responseSize, perDeviceLimit, metas, stats);
+            remainingTotal += stats.depth;
+            if (numResponses == 0)
+            {
+                numResponses = _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, devicePollResponseData, responseSize, perDeviceLimit);
+            }
+        }
+        else
+        {
+            stats = _busStatusMgr.getOfflineStats(address);
+            remainingTotal += stats.depth;
+            numResponses = _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, devicePollResponseData, responseSize, perDeviceLimit);
+        }
 
         // Get poll response JSON
         if (devicePollResponseData.size() > 0)
@@ -389,6 +1476,8 @@ std::vector<uint8_t> DeviceIdentMgr::getQueuedDeviceDataBinary(uint32_t connMode
             RaftDevice::genBinaryDataMsg(binData, connMode, address, deviceTypeIndex, isOnline, devicePollResponseData);
         }
     }
+
+    setOfflineStatsRemaining(remainingTotal, pRemaining);
 
     // Return binary data
     return binData;

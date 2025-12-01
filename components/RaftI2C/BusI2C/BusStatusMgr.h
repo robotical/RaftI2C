@@ -98,6 +98,48 @@ public:
                 uint32_t& responseSize, uint32_t maxResponsesToReturn);
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// @brief Get offline poll responses for a specific address
+    /// @param address - address of device to get responses for
+    /// @param isOnline - (out) true if device is online
+    /// @param deviceTypeIndex - (out) device type index
+    /// @param devicePollResponseData - (out) vector to store the device poll response data
+    /// @param responseSize - (out) size of the response data
+    /// @param maxResponsesToReturn - maximum number of responses to return (0 for no limit)
+    /// @param metas - (out) metadata for each response
+    /// @param stats - (out) offline buffer stats after responses removed
+    /// @return number of responses returned
+    uint32_t getBusElemOfflineResponses(uint32_t address, bool& isOnline, uint16_t& deviceTypeIndex,
+                std::vector<uint8_t>& devicePollResponseData, uint32_t& responseSize,
+                uint32_t maxResponsesToReturn, std::vector<OfflineDataMeta>& metas, OfflineDataStats& stats);
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// @brief Peek at offline responses without consuming
+    uint32_t peekBusElemOfflineResponses(uint32_t address, bool& isOnline, uint16_t& deviceTypeIndex,
+                std::vector<uint8_t>& devicePollResponseData, uint32_t& responseSize,
+                uint32_t startIdx, uint32_t maxResponsesToReturn, uint32_t maxBytes,
+                std::vector<OfflineDataMeta>& metas, OfflineDataStats& stats);
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// @brief Get offline stats for an address without removing data
+    OfflineDataStats getOfflineStats(BusElemAddrType address) const;
+
+    /// @brief Total offline allocation bytes across devices
+    uint32_t getOfflineBytesInUse() const;
+
+    /// @brief Pause/resume buffering for an address
+    bool setOfflineBufferPaused(BusElemAddrType address, bool paused);
+
+    /// @brief Pause/resume draining for an address
+    bool setOfflineDrainPaused(BusElemAddrType address, bool paused);
+
+    /// @brief Reset offline buffer for an address
+    bool resetOfflineBuffer(BusElemAddrType address);
+
+    /// @brief Reconfigure offline buffer depth/size for an address
+    bool reconfigureOfflineBuffer(BusElemAddrType address, uint32_t maxEntries, uint32_t payloadSize,
+                uint32_t timestampBytes, uint32_t timestampResolutionUs);
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Register for device data notifications
     /// @param addrAndSlot address
     /// @param dataChangeCB Callback for data change
@@ -126,6 +168,12 @@ public:
     /// @param pollIntervalUs Poll interval in microseconds
     /// @return true if updated
     bool setDevicePollInterval(BusElemAddrType address, uint32_t pollIntervalUs);
+
+    /// @brief Get current polling interval (us) for an address
+    uint32_t getDevicePollIntervalUs(BusElemAddrType address) const;
+
+    /// @brief Get a copy of polling info for an address
+    bool getDevicePollingInfo(BusElemAddrType address, DevicePollingInfo& pollInfoOut) const;
 
 private:
     // Bus element status change mutex
