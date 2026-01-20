@@ -14,6 +14,7 @@
 #include "Logger.h"
 #include "RaftJsonPrefixed.h"
 #include "OfflineDataStore.h"
+#include "RaftUtils.h"
 #include <algorithm>
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
@@ -56,6 +57,12 @@ void DeviceIdentMgr::setup(const RaftJsonIF& config)
                 _isEnabled ? "enabled" : "disabled",
                 _offlinePolicy.defaultWindowMs, _offlinePolicy.perDeviceMaxBytes, _offlinePolicy.globalMaxBytes,
                 _offlinePolicy.maxPerPublish);
+    if (_offlineNvsConfig.enabled)
+    {
+        LOG_I(MODULE_PREFIX, "offlineBuf NVS mirror flushMs %u importOnBoot %s",
+                (unsigned)_offlineNvsConfig.flushIntervalMs,
+                _offlineNvsConfig.importOnBoot ? "Y" : "N");
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -78,6 +85,18 @@ void DeviceIdentMgr::parseOfflineConfig(const RaftJsonIF& config)
     }
     _offlinePolicy.memUsePermille = offlineCfg.getLong("memUsePermille", _offlinePolicy.memUsePermille);
 
+    // NVS mirror settings
+    String storageMode = offlineCfg.getString("storage", "ram");
+    storageMode.toLowerCase();
+    _offlineNvsConfig.enabled = storageMode.indexOf("nvs") >= 0;
+    uint32_t flushMs = offlineCfg.getLong("flushIntervalMs", 10000);
+    if (flushMs < 1000)
+        flushMs = 1000;
+    if (flushMs > 600000)
+        flushMs = 600000;
+    _offlineNvsConfig.flushIntervalMs = flushMs;
+    _offlineNvsConfig.importOnBoot = offlineCfg.getBool("importOnBoot", true);
+
     // Per device overrides
     std::vector<String> devOverrides;
     if (offlineCfg.getArrayElems("devices", devOverrides))
@@ -92,6 +111,253 @@ void DeviceIdentMgr::parseOfflineConfig(const RaftJsonIF& config)
                 _offlinePolicy.perDeviceWindowMs[std::string(typeName.c_str())] = windowMs;
             }
         }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Loop (periodic service)
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void DeviceIdentMgr::loop()
+{
+    if (!_offlineNvsConfig.enabled)
+        return;
+    if (_offlineNvsStates.empty())
+    {
+        static bool loggedNoNvsStates = false;
+        if (!loggedNoNvsStates)
+        {
+            LOG_I(MODULE_PREFIX, "offline NVS loop skip (no configured devices yet)");
+            loggedNoNvsStates = true;
+        }
+        return;
+    }
+    uint32_t nowMs = millis();
+    flushOfflineNvs(nowMs);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Configure NVS mirror for an address (if enabled)
+void DeviceIdentMgr::configureOfflineNvsState(BusElemAddrType address, const DevicePollingInfo& pollInfo, uint32_t maxEntries)
+{
+    if (!_offlineNvsConfig.enabled || maxEntries == 0 || pollInfo.pollResultSizeIncTimestamp == 0)
+        return;
+
+    LOG_I(MODULE_PREFIX, "offline NVS config addr %s maxEntries %u payload %u",
+            BusI2CAddrAndSlot::toString(address).c_str(), (unsigned)maxEntries,
+            (unsigned)pollInfo.pollResultSizeIncTimestamp);
+
+    OfflineNvsState& state = _offlineNvsStates[address];
+    state.payloadSize = pollInfo.pollResultSizeIncTimestamp;
+    state.timestampBytes = DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE;
+    state.timestampResolutionUs = DevicePollingInfo::POLL_RESULT_RESOLUTION_US;
+    state.ramMaxEntries = maxEntries;
+
+    char nsBuf[16];
+    snprintf(nsBuf, sizeof(nsBuf), "ob%08x", (unsigned)address);
+    if (!state.store.configure(nsBuf, state.payloadSize, state.timestampBytes, state.timestampResolutionUs, maxEntries))
+    {
+        LOG_W(MODULE_PREFIX, "offline NVS configure failed addr %s",
+                BusI2CAddrAndSlot::toString(address).c_str());
+        return;
+    }
+    state.store.setEffectiveMaxEntries(maxEntries);
+    LOG_I(MODULE_PREFIX, "offline NVS ready addr %s count %u nextSeq %u imported %s",
+            BusI2CAddrAndSlot::toString(address).c_str(),
+            (unsigned)state.store.getCount(), (unsigned)state.store.getNextSeq(),
+            state.imported ? "Y" : "N");
+
+    if (!state.hasFlushedSeq)
+    {
+        uint32_t nextSeq = state.store.getNextSeq();
+        if (state.store.getCount() > 0 && nextSeq > 0)
+        {
+            state.lastFlushedSeq = nextSeq - 1;
+            state.hasFlushedSeq = true;
+        }
+    }
+
+    if (_offlineNvsConfig.importOnBoot && !state.imported)
+    {
+        uint32_t nextSeq = 0;
+        LOG_I(MODULE_PREFIX, "offline NVS import start addr %s count %u",
+                BusI2CAddrAndSlot::toString(address).c_str(), (unsigned)state.store.getCount());
+        bool imported = _busStatusMgr.importOfflineFromNVS(address, state.store, maxEntries, nextSeq);
+        if (imported)
+        {
+            state.imported = true;
+            if (nextSeq > 0)
+            {
+                state.lastFlushedSeq = nextSeq - 1;
+                state.hasFlushedSeq = true;
+            }
+        }
+        else if (state.store.getCount() == 0)
+        {
+            state.imported = true;
+        }
+        LOG_I(MODULE_PREFIX, "offline NVS import done addr %s imported %s nextSeq %u",
+                BusI2CAddrAndSlot::toString(address).c_str(), imported ? "Y" : "N",
+                (unsigned)nextSeq);
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Flush offline buffers to NVS as needed
+void DeviceIdentMgr::flushOfflineNvs(uint32_t nowMs)
+{
+    static const uint32_t NVS_FLUSH_CHUNK_BYTES = 64 * 1024;
+    if (_offlineNvsConfig.flushIntervalMs == 0)
+        return;
+
+    for (auto& kv : _offlineNvsStates)
+    {
+        BusElemAddrType address = kv.first;
+        OfflineNvsState& state = kv.second;
+        if (!state.store.isReady() || state.ramMaxEntries == 0)
+            continue;
+        if (!Raft::isTimeout(nowMs, state.lastFlushMs, _offlineNvsConfig.flushIntervalMs))
+            continue;
+
+        OfflineDataStats stats = _busStatusMgr.getOfflineStats(address);
+        if (stats.maxEntries == 0 || stats.payloadSize == 0)
+        {
+            state.lastFlushMs = nowMs;
+            continue;
+        }
+        if (stats.depth == 0)
+        {
+            if (state.lastFlushMs == 0)
+            {
+                LOG_I(MODULE_PREFIX, "offline NVS flush skip addr %s depth 0 (no data yet)",
+                        BusI2CAddrAndSlot::toString(address).c_str());
+            }
+            state.lastFlushMs = nowMs;
+            continue;
+        }
+
+        state.store.setEffectiveMaxEntries(state.ramMaxEntries);
+
+        uint32_t startIdx = 0;
+        if (state.hasFlushedSeq)
+        {
+            if (state.lastFlushedSeq >= stats.firstSeq)
+            {
+                startIdx = state.lastFlushedSeq - stats.firstSeq + 1;
+            }
+            else
+            {
+                startIdx = 0;
+            }
+        }
+        if (startIdx >= stats.depth)
+        {
+            LOG_I(MODULE_PREFIX, "offline NVS flush skip addr %s no new entries depth %u firstSeq %u lastSeq %u",
+                    BusI2CAddrAndSlot::toString(address).c_str(), (unsigned)stats.depth,
+                    (unsigned)stats.firstSeq, (unsigned)state.lastFlushedSeq);
+            state.lastFlushMs = nowMs;
+            continue;
+        }
+
+        LOG_I(MODULE_PREFIX, "offline NVS flush addr %s depth %u firstSeq %u startIdx %u lastSeq %u",
+                BusI2CAddrAndSlot::toString(address).c_str(), (unsigned)stats.depth,
+                (unsigned)stats.firstSeq, (unsigned)startIdx, (unsigned)state.lastFlushedSeq);
+
+        uint32_t tsResMs = stats.timestampResolutionUs / 1000;
+        while (startIdx < stats.depth)
+        {
+            bool isOnline = false;
+            uint16_t deviceTypeIndex = 0;
+            std::vector<uint8_t> devicePollResponseData;
+            uint32_t responseSize = 0;
+            std::vector<OfflineDataMeta> metas;
+            OfflineDataStats statsNow;
+            uint32_t numResponses = _busStatusMgr.peekBusElemOfflineResponses(address, isOnline, deviceTypeIndex,
+                        devicePollResponseData, responseSize, startIdx, 0, NVS_FLUSH_CHUNK_BYTES, metas, statsNow);
+            if (numResponses == 0 || metas.empty())
+                break;
+
+            std::vector<uint32_t> adjTsMs;
+            adjTsMs.reserve(numResponses);
+            for (uint32_t ii = 0; ii < numResponses; ii++)
+            {
+                uint64_t adj = metas[ii].tsBaseMs + (uint64_t)metas[ii].ts * tsResMs;
+                adjTsMs.push_back((uint32_t)adj);
+            }
+
+            uint32_t lastSeq = 0;
+            bool ok = state.store.appendBatch(devicePollResponseData, responseSize, adjTsMs,
+                        metas.front().seq, numResponses, lastSeq);
+            if (!ok)
+            {
+                LOG_W(MODULE_PREFIX, "offline NVS append failed addr %s responses %u",
+                        BusI2CAddrAndSlot::toString(address).c_str(), (unsigned)numResponses);
+                break;
+            }
+            LOG_I(MODULE_PREFIX, "offline NVS append addr %s responses %u lastSeq %u",
+                    BusI2CAddrAndSlot::toString(address).c_str(), (unsigned)numResponses, (unsigned)lastSeq);
+            state.lastFlushedSeq = lastSeq;
+            state.hasFlushedSeq = true;
+            startIdx += numResponses;
+        }
+
+        state.lastFlushMs = nowMs;
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Clear NVS mirror state for addresses
+void DeviceIdentMgr::clearOfflineNvsState(const std::vector<BusElemAddrType>& addresses)
+{
+    if (!_offlineNvsConfig.enabled)
+        return;
+    for (auto addr : addresses)
+    {
+        auto it = _offlineNvsStates.find(addr);
+        if (it == _offlineNvsStates.end())
+            continue;
+        it->second.store.clear();
+        it->second.imported = false;
+        it->second.hasFlushedSeq = false;
+        it->second.lastFlushedSeq = 0;
+        it->second.lastFlushMs = 0;
+        it->second.ramMaxEntries = 0;
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Ensure NVS mirror is configured (and imported) for peeked addresses
+void DeviceIdentMgr::ensureOfflineNvsForPeek(const std::vector<BusElemAddrType>& addresses)
+{
+    if (!_offlineNvsConfig.enabled || !_offlineNvsConfig.importOnBoot)
+        return;
+
+    std::vector<BusElemAddrType> targetAddrs = addresses;
+    if (targetAddrs.empty())
+        _busStatusMgr.getBusElemAddresses(targetAddrs, false);
+
+    for (auto addr : targetAddrs)
+    {
+        DevicePollingInfo pollInfo;
+        if (!_busStatusMgr.getDevicePollingInfo(addr, pollInfo))
+            continue;
+
+        OfflineDataStats stats = _busStatusMgr.getOfflineStats(addr);
+        uint32_t depth = stats.maxEntries;
+        if (depth == 0)
+        {
+            depth = computeDepthForAddress(addr, pollInfo);
+            if (depth == 0)
+                continue;
+            _busStatusMgr.reconfigureOfflineBuffer(addr, depth,
+                    pollInfo.pollResultSizeIncTimestamp,
+                    DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE,
+                    DevicePollingInfo::POLL_RESULT_RESOLUTION_US);
+            LOG_I(MODULE_PREFIX, "offline NVS peek configure addr %s depth %u payload %u",
+                    BusI2CAddrAndSlot::toString(addr).c_str(), (unsigned)depth,
+                    (unsigned)pollInfo.pollResultSizeIncTimestamp);
+        }
+        configureOfflineNvsState(addr, pollInfo, depth);
     }
 }
 
@@ -410,6 +676,7 @@ bool DeviceIdentMgr::applyRateOverrideToAddress(BusElemAddrType address, uint32_
     {
         _busStatusMgr.reconfigureOfflineBuffer(address, depth, pollInfo.pollResultSizeIncTimestamp,
                 DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE, DevicePollingInfo::POLL_RESULT_RESOLUTION_US);
+        configureOfflineNvsState(address, pollInfo, depth);
     }
     return updated;
 }
@@ -578,6 +845,7 @@ bool DeviceIdentMgr::rebalanceOfflineBuffers(const std::vector<BusElemAddrType>&
                 pollInfo.pollResultSizeIncTimestamp,
                 DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE,
                 DevicePollingInfo::POLL_RESULT_RESOLUTION_US);
+        configureOfflineNvsState(addr, pollInfo, depth);
         LOG_I(MODULE_PREFIX, "rebalance addr %s freeMem %u freeNow %u largest %u currentBytes %u budget %u headroom %u perDev %u bytesPerEntry %u depth %u targets %u updated %d",
                 BusI2CAddrAndSlot::toString(addr).c_str(), (unsigned)freeMem, (unsigned)freeMemNow,
                 (unsigned)largestBlock, (unsigned)currentBytes,
@@ -949,6 +1217,8 @@ void DeviceIdentMgr::resetOfflineBuffers(const std::vector<BusElemAddrType>& add
         }
     }
 
+    clearOfflineNvsState(targetAddrs);
+
     applyOfflineControlToExisting();
 }
 
@@ -1073,6 +1343,11 @@ void DeviceIdentMgr::identifyDevice(BusElemAddrType address, DeviceStatus& devic
             // Defer offline buffer allocation until an explicit offlinebuf start command
             deviceStatus.setOfflineBufferPaused(true);
             applyOfflineControlsToDevice(address, deviceStatus);
+            if (_offlineNvsConfig.enabled && _offlineNvsConfig.importOnBoot)
+            {
+                LOG_I(MODULE_PREFIX, "offline NVS import deferred addr %s (offlinebuf start required)",
+                        BusI2CAddrAndSlot::toString(address).c_str());
+            }
 
 #ifdef DEBUG_HANDLE_BUS_DEVICE_INFO
             LOG_I(MODULE_PREFIX, "setBusElemDevInfo address %s numPollResToStore %d pollResSizeIncTimestamp %d", 
@@ -1306,10 +1581,12 @@ String DeviceIdentMgr::getDevTypeInfoJsonByTypeIdx(uint16_t deviceTypeIdx, bool 
 /// @brief Peek offline data without consuming
 String DeviceIdentMgr::peekOfflineDataJson(const std::vector<BusElemAddrType>& addresses,
             uint32_t startIdx, uint32_t maxResponsesToReturn, uint32_t maxBytes,
-            uint32_t& totalRemaining) const
+            uint32_t& totalRemaining)
 {
     String jsonStr;
     totalRemaining = 0;
+
+    ensureOfflineNvsForPeek(addresses);
 
     std::vector<BusElemAddrType> targetAddrs = addresses;
     if (targetAddrs.empty())

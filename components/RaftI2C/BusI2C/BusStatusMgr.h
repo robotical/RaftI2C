@@ -13,6 +13,7 @@
 #include "RaftBus.h"
 #include "RaftUtils.h"
 #include "DeviceStatus.h"
+#include "OfflineDataStoreNVS.h"
 #include "BusAddrStatus.h"
 #include <list>
 
@@ -138,6 +139,10 @@ public:
     /// @brief Reconfigure offline buffer depth/size for an address
     bool reconfigureOfflineBuffer(BusElemAddrType address, uint32_t maxEntries, uint32_t payloadSize,
                 uint32_t timestampBytes, uint32_t timestampResolutionUs);
+
+    /// @brief Import offline data from NVS into RAM for an address
+    bool importOfflineFromNVS(BusElemAddrType address, OfflineDataStoreNVS& nvsStore,
+                uint32_t importMaxEntries, uint32_t& outNextSeq);
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Register for device data notifications

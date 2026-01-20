@@ -7,6 +7,7 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "BusStatusMgr.h"
+#include "BusI2CAddrAndSlot.h"
 #include "Logger.h"
 #include "RaftUtils.h"
 #include "DeviceIdentMgr.h"
@@ -899,9 +900,38 @@ bool BusStatusMgr::reconfigureOfflineBuffer(BusElemAddrType address, uint32_t ma
         xSemaphoreGive(_busElemStatusMutex);
         return false;
     }
+    LOG_I("BusStatusMgr", "reconfigureOfflineBuffer addr %s maxEntries %u payload %u",
+            BusI2CAddrAndSlot::toString(address).c_str(), (unsigned)maxEntries, (unsigned)payloadSize);
     pAddrStatus->deviceStatus.configureOfflineBuffer(maxEntries, payloadSize, timestampBytes, timestampResolutionUs);
     xSemaphoreGive(_busElemStatusMutex);
     return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Import offline data from NVS for an address
+bool BusStatusMgr::importOfflineFromNVS(BusElemAddrType address, OfflineDataStoreNVS& nvsStore,
+            uint32_t importMaxEntries, uint32_t& outNextSeq)
+{
+    outNextSeq = 0;
+    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+        return false;
+    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    if (!pAddrStatus)
+    {
+        xSemaphoreGive(_busElemStatusMutex);
+        return false;
+    }
+    LOG_I("BusStatusMgr", "importOfflineFromNVS addr %s nvsCount %u importMax %u",
+            BusI2CAddrAndSlot::toString(address).c_str(),
+            (unsigned)nvsStore.getCount(), (unsigned)importMaxEntries);
+    bool wasPaused = pAddrStatus->deviceStatus.isOfflineBufferPaused();
+    pAddrStatus->deviceStatus.setOfflineBufferPaused(true);
+    bool ok = nvsStore.importTo(pAddrStatus->deviceStatus.offlineData, importMaxEntries, outNextSeq);
+    if (ok)
+        pAddrStatus->deviceStatus.setOfflineSeq(outNextSeq);
+    pAddrStatus->deviceStatus.setOfflineBufferPaused(wasPaused);
+    xSemaphoreGive(_busElemStatusMutex);
+    return ok;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////

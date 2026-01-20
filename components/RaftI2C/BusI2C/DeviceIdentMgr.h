@@ -12,6 +12,7 @@
 #include "DeviceTypeRecord.h"
 #include "BusStatusMgr.h"
 #include "DeviceStatus.h"
+#include "OfflineDataStoreNVS.h"
 #include "RaftJson.h"
 #include <vector>
 #include <list>
@@ -32,6 +33,10 @@ public:
     /// @brief Setup
     /// @param config configuration
     void setup(const RaftJsonIF& config);
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// @brief Loop (periodic service)
+    void loop();
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Get list of device addresses attached to the bus
@@ -156,7 +161,7 @@ public:
     /// @brief Peek at offline data without consuming
     String peekOfflineDataJson(const std::vector<BusElemAddrType>& addresses,
                 uint32_t startIdx, uint32_t maxResponsesToReturn, uint32_t maxBytes,
-                uint32_t& totalRemaining) const override;
+                uint32_t& totalRemaining) override;
 
     /// @brief Apply a rate override (ms) while buffering
     bool applyOfflineRateOverride(const std::vector<BusElemAddrType>& addresses, uint32_t pollRateMs) override;
@@ -238,6 +243,26 @@ private:
         std::map<std::string, uint32_t> perDeviceWindowMs;
     };
 
+    struct OfflineNvsConfig
+    {
+        bool enabled = false;
+        uint32_t flushIntervalMs = 10000;
+        bool importOnBoot = true;
+    };
+
+    struct OfflineNvsState
+    {
+        OfflineDataStoreNVS store;
+        bool imported = false;
+        bool hasFlushedSeq = false;
+        uint32_t lastFlushedSeq = 0;
+        uint32_t lastFlushMs = 0;
+        uint32_t ramMaxEntries = 0;
+        uint32_t payloadSize = 0;
+        uint32_t timestampBytes = 0;
+        uint32_t timestampResolutionUs = 0;
+    };
+
     uint32_t calcOfflineDepth(const DeviceTypeRecord& devTypeRec, const DevicePollingInfo& pollInfo) const;
     void parseOfflineConfig(const RaftJsonIF& config);
     void setOfflineStatsRemaining(uint32_t remaining, uint32_t* pRemaining) const;
@@ -253,10 +278,17 @@ private:
     bool applyRateOverrideToAddress(BusElemAddrType address, uint32_t pollRateMs, bool recordOriginal);
     bool clearRateOverrideForAddress(BusElemAddrType address);
 
+    void configureOfflineNvsState(BusElemAddrType address, const DevicePollingInfo& pollInfo, uint32_t maxEntries);
+    void flushOfflineNvs(uint32_t nowMs);
+    void clearOfflineNvsState(const std::vector<BusElemAddrType>& addresses);
+    void ensureOfflineNvsForPeek(const std::vector<BusElemAddrType>& addresses);
+
     // Debug
     static constexpr const char* MODULE_PREFIX = "RaftDevIdentMgr";
 
     OfflineBufferPolicy _offlinePolicy;
+    OfflineNvsConfig _offlineNvsConfig;
+    std::map<BusElemAddrType, OfflineNvsState> _offlineNvsStates;
     uint32_t _maxPerPublishOverride = 0;
     bool _drainOnlySelected = false;
     std::set<BusElemAddrType> _drainSelectedAddrs;

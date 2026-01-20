@@ -247,6 +247,9 @@ void BusI2C::loop()
     // Service bus status change detection
     _busStatusMgr.loop(_pI2CCentral ? _pI2CCentral->isOperatingOk() : false);
 
+    // Service device ident manager (offline buffer persistence)
+    _deviceIdentMgr.loop();
+
     // Service bus mux
     _busMultiplexers.loop();
 
@@ -629,4 +632,3 @@ void BusI2C::hiatus(uint32_t forPeriodMs)
     LOG_I("BusI2C", "hiatus req for %dms", forPeriodMs);
 #endif
 }
-
