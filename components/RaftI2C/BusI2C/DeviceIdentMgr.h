@@ -14,6 +14,8 @@
 #include "DeviceStatus.h"
 #include "OfflineDataStoreNVS.h"
 #include "RaftJson.h"
+#include "RaftJsonNVS.h"
+#include <memory>
 #include <vector>
 #include <list>
 #include <map>
@@ -148,6 +150,9 @@ public:
     /// @brief Pause/resume draining due to link availability
     void setOfflineDrainLinkPaused(bool paused) override;
 
+    /// @brief Persist auto-resume recording state for reboot
+    void setOfflineAutoResume(bool enabled, const std::vector<BusElemAddrType>& addresses, uint32_t rateOverrideMs) override;
+
     /// @brief Reset offline buffers for addresses
     void resetOfflineBuffers(const std::vector<BusElemAddrType>& addresses) override;
 
@@ -263,6 +268,13 @@ private:
         uint32_t timestampResolutionUs = 0;
     };
 
+    struct OfflineResumeState
+    {
+        bool active = false;
+        uint32_t rateOverrideMs = 0;
+        std::set<BusElemAddrType> targetAddrs;
+    };
+
     uint32_t calcOfflineDepth(const DeviceTypeRecord& devTypeRec, const DevicePollingInfo& pollInfo) const;
     void parseOfflineConfig(const RaftJsonIF& config);
     void setOfflineStatsRemaining(uint32_t remaining, uint32_t* pRemaining) const;
@@ -279,9 +291,14 @@ private:
     bool clearRateOverrideForAddress(BusElemAddrType address);
 
     void configureOfflineNvsState(BusElemAddrType address, const DevicePollingInfo& pollInfo, uint32_t maxEntries);
+    void importOfflineNvsIfNeeded(BusElemAddrType address, uint32_t maxEntries);
     void flushOfflineNvs(uint32_t nowMs);
     void clearOfflineNvsState(const std::vector<BusElemAddrType>& addresses);
     void ensureOfflineNvsForPeek(const std::vector<BusElemAddrType>& addresses);
+    void loadOfflineResumeState(const RaftJsonIF& config);
+    void saveOfflineResumeState();
+    void queueOfflineResume(BusElemAddrType address);
+    void processOfflineResumePending();
 
     // Debug
     static constexpr const char* MODULE_PREFIX = "RaftDevIdentMgr";
@@ -289,6 +306,11 @@ private:
     OfflineBufferPolicy _offlinePolicy;
     OfflineNvsConfig _offlineNvsConfig;
     std::map<BusElemAddrType, OfflineNvsState> _offlineNvsStates;
+    OfflineResumeState _offlineResume;
+    std::set<BusElemAddrType> _offlineResumePending;
+    bool _offlineResumeLoaded = false;
+    String _offlineResumeNamespace;
+    std::unique_ptr<RaftJsonNVS> _offlineResumeNvs;
     uint32_t _maxPerPublishOverride = 0;
     bool _drainOnlySelected = false;
     std::set<BusElemAddrType> _drainSelectedAddrs;

@@ -900,6 +900,15 @@ bool BusStatusMgr::reconfigureOfflineBuffer(BusElemAddrType address, uint32_t ma
         xSemaphoreGive(_busElemStatusMutex);
         return false;
     }
+    OfflineDataStats current = pAddrStatus->deviceStatus.getOfflineStats();
+    if (current.maxEntries == maxEntries &&
+            current.payloadSize == payloadSize &&
+            current.timestampBytes == timestampBytes &&
+            current.timestampResolutionUs == timestampResolutionUs)
+    {
+        xSemaphoreGive(_busElemStatusMutex);
+        return true;
+    }
     LOG_I("BusStatusMgr", "reconfigureOfflineBuffer addr %s maxEntries %u payload %u",
             BusI2CAddrAndSlot::toString(address).c_str(), (unsigned)maxEntries, (unsigned)payloadSize);
     pAddrStatus->deviceStatus.configureOfflineBuffer(maxEntries, payloadSize, timestampBytes, timestampResolutionUs);
