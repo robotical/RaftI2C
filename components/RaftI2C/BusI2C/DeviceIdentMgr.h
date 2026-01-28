@@ -130,6 +130,10 @@ public:
         return _busStatusMgr.getOfflineStats(address);
     }
 
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// @brief Offline NVS count passthrough
+    virtual uint32_t getOfflineNvsCount(BusElemAddrType address) const override final;
+
     /// @brief Override max per publish for offline backlog
     void setOfflineMaxPerPublishOverride(uint32_t maxPerPublish) override;
 

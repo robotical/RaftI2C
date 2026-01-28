@@ -186,6 +186,10 @@ void DeviceIdentMgr::loadOfflineResumeState(const RaftJsonIF& config)
         LOG_I(MODULE_PREFIX, "offline auto-resume loaded targets %u rateMs %u",
                 (unsigned)_offlineResume.targetAddrs.size(), (unsigned)_offlineResume.rateOverrideMs);
     }
+    LOG_I(MODULE_PREFIX, "offline auto-resume state active %s targets %u rateMs %u",
+            _offlineResume.active ? "Y" : "N",
+            (unsigned)_offlineResume.targetAddrs.size(),
+            (unsigned)_offlineResume.rateOverrideMs);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -878,6 +882,7 @@ bool DeviceIdentMgr::applyRateOverrideToAddress(BusElemAddrType address, uint32_
     DevicePollingInfo pollInfo;
     if (!_busStatusMgr.getDevicePollingInfo(address, pollInfo))
         return false;
+    uint32_t originalIntervalUs = pollInfo.pollIntervalUs;
 
     if (recordOriginal && _offlineCtrlMutex && (xSemaphoreTake(_offlineCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE))
     {
@@ -891,8 +896,9 @@ bool DeviceIdentMgr::applyRateOverrideToAddress(BusElemAddrType address, uint32_
     OfflineDataStats existingStats = _busStatusMgr.getOfflineStats(address);
     uint32_t depth = existingStats.maxEntries > 0 ? existingStats.maxEntries : computeDepthForAddress(address, pollInfo);
     bool updated = _busStatusMgr.setDevicePollInterval(address, pollIntervalUs);
-    LOG_I(MODULE_PREFIX, "offline rate override addr %s intervalUs %u depth %u payload %u",
-                BusI2CAddrAndSlot::toString(address).c_str(), pollInfo.pollIntervalUs, depth, pollInfo.pollResultSizeIncTimestamp);
+    LOG_I(MODULE_PREFIX, "offline rate override addr %s intervalUs %u (was %u) depth %u payload %u",
+                BusI2CAddrAndSlot::toString(address).c_str(), pollInfo.pollIntervalUs,
+                originalIntervalUs, depth, pollInfo.pollResultSizeIncTimestamp);
     if (depth > 0)
     {
         _busStatusMgr.reconfigureOfflineBuffer(address, depth, pollInfo.pollResultSizeIncTimestamp,
@@ -1107,7 +1113,23 @@ bool DeviceIdentMgr::clearRateOverrideForAddress(BusElemAddrType address)
         originalIntervalUs = pollInfo.pollIntervalUs;
 
     pollInfo.pollIntervalUs = originalIntervalUs;
+    LOG_I(MODULE_PREFIX, "offline rate override clear addr %s restore intervalUs %u",
+            BusI2CAddrAndSlot::toString(address).c_str(), pollInfo.pollIntervalUs);
     return _busStatusMgr.setDevicePollInterval(address, pollInfo.pollIntervalUs);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Get NVS-backed offline count for an address
+uint32_t DeviceIdentMgr::getOfflineNvsCount(BusElemAddrType address) const
+{
+    if (!_offlineNvsConfig.enabled)
+        return 0;
+    auto it = _offlineNvsStates.find(address);
+    if (it == _offlineNvsStates.end())
+        return 0;
+    if (!it->second.store.isReady())
+        return 0;
+    return it->second.store.getCount();
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
