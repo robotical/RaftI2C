@@ -150,7 +150,7 @@ public:
     /// @param dataChangeCB Callback for data change
     /// @param minTimeBetweenReportsMs Minimum time between reports (ms)
     /// @param pCallbackInfo Callback info (passed to the callback)
-    void registerForDeviceData(BusElemAddrType address, RaftDeviceDataChangeCB dataChangeCB,
+    void registerForDeviceData(BusElemAddrType addrAndSlot, RaftDeviceDataChangeCB dataChangeCB,
                 uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo);
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -168,21 +168,26 @@ public:
     String getDebugJSON(bool includeBraces) const;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    /// @brief Set device polling interval (us) for a specific address
+    /// @brief Set device polling interval for a specific address
+    /// @param address Composite address (slot+I2C)
+    /// @param pollIntervalMs Poll interval in milliseconds
+    /// @return true if updated
+    bool setDevicePollInterval(BusElemAddrType address, uint32_t pollIntervalMs);
+
+    /// @brief Set device polling interval in microseconds (internal helper)
     /// @param address Composite address (slot+I2C)
     /// @param pollIntervalUs Poll interval in microseconds
     /// @return true if updated
-    bool setDevicePollInterval(BusElemAddrType address, uint32_t pollIntervalUs);
+    bool setDevicePollIntervalUs(BusElemAddrType address, uint32_t pollIntervalUs);
 
     /// @brief Get current polling interval (us) for an address
     uint32_t getDevicePollIntervalUs(BusElemAddrType address) const;
 
     /// @brief Get a copy of polling info for an address
     bool getDevicePollingInfo(BusElemAddrType address, DevicePollingInfo& pollInfoOut) const;
-
 private:
     // Bus element status change mutex
-    SemaphoreHandle_t _busElemStatusMutex = nullptr;
+    mutable RaftMutex _busElemStatusMutex;
 
     // Bus base
     RaftBus& _raftBus;
@@ -231,5 +236,5 @@ private:
     uint32_t _lastPollOrStatusUpdateTimeMs = 0;
 
     // Debug
-    static constexpr const char* MODULE_PREFIX = "RaftBusStMgr";    
+    static constexpr const char* MODULE_PREFIX = "I2CBusStMgr";    
 };

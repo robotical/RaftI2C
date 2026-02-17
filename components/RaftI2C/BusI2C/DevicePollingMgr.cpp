@@ -46,20 +46,17 @@ void DevicePollingMgr::taskService(uint64_t timeNowUs)
         if (pollInfo.pollReqs.size() == 0)
             return;
         BusElemAddrType address = pollInfo.pollReqs[0].getAddress();
-        BusI2CAddrAndSlot addrAndSlot = BusI2CAddrAndSlot::fromBusElemAddrType(address);
-        // LOG_I(MODULE_PREFIX, "poll addr %s intervalUs %u reqs %u sizeIncTs %u",
-        //             addrAndSlot.toString().c_str(), pollInfo.pollIntervalUs, (uint32_t)pollInfo.pollReqs.size(),
-        //             pollInfo.pollResultSizeIncTimestamp);
+        BusI2CAddrAndSlot addrAndSlot(address);
 
         // Get the next request index
         uint32_t nextReqIdx = pollInfo.partialPollNextReqIdx;
 
 #ifdef DEBUG_POLL_REQUEST
-        LOG_I(MODULE_PREFIX, "taskService poll %s (%04x)", addrAndSlot.toString().c_str(), address);
+        LOG_I(MODULE_PREFIX, "taskService pollreq %s (%04x)", addrAndSlot.toString().c_str(), address);
 #endif
 
         // Enable the slot
-        auto rslt = _busMultiplexers.enableOneSlot(addrAndSlot.slotNum);
+        auto rslt = _busMultiplexers.enableOneSlot(addrAndSlot.getSlotNum());
         if (rslt != RAFT_OK)
             return;
 
@@ -91,14 +88,14 @@ void DevicePollingMgr::taskService(uint64_t timeNowUs)
 
 #ifdef DEBUG_POLL_RESULT
 #ifdef DEBUG_POLL_RESULT_SPECIFIC_ADDRESS
-            if (addrAndSlot.i2cAddr == DEBUG_POLL_RESULT_SPECIFIC_ADDRESS)
+            if (addrAndSlot.getI2CAddr() == DEBUG_POLL_RESULT_SPECIFIC_ADDRESS)
 #endif
             {
                 String writeDataHexStr;
                 Raft::getHexStrFromBytes(busReqRec.getWriteData(), busReqRec.getWriteDataLen(), writeDataHexStr);
                 String readDataHexStr;
                 Raft::getHexStrFromBytes(readData.data(), readData.size(), readDataHexStr);
-                LOG_I(MODULE_PREFIX, "taskService poll addr %s (%04x) writeData %s readData %s rslt %s", 
+                LOG_I(MODULE_PREFIX, "taskService pollrslt addr %s (%04x) writeData %s readData %s rslt %s", 
                                 addrAndSlot.toString().c_str(),
                                 address,
                                 writeDataHexStr.c_str(),
@@ -109,7 +106,7 @@ void DevicePollingMgr::taskService(uint64_t timeNowUs)
 
             if (rslt != RAFT_OK)
             {
-                bool isOnline = true;
+                bool isOnline = false;
                 _busStatusMgr.updateBusElemState(address, false, isOnline);
                 allResultsOkAndComplete = false;
                 break;
