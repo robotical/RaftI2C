@@ -100,10 +100,9 @@ BusI2C::~BusI2C()
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// @brief Setup
-/// @param busNum - bus number
 /// @param config Configuration
 /// @return true if successful
-bool BusI2C::setup(BusNumType busNum, const RaftJsonIF& config)
+bool BusI2C::setup(const RaftJsonIF& config)
 {
     // Note:
     // No attempt is made here to clean-up properly
@@ -113,8 +112,6 @@ bool BusI2C::setup(BusNumType busNum, const RaftJsonIF& config)
     // Check if already configured
     if (_initOk)
         return false;
-    _busNum = busNum;
-
     // Get bus details
     _i2cPort = config.getLong("i2cPort", 0);
     String pinName = config.getString("sdaPin", "");
@@ -201,6 +198,7 @@ bool BusI2C::setup(BusNumType busNum, const RaftJsonIF& config)
     // Reset pause status
     _pauseRequested = false;
     _isPaused = false;
+    _lastZeroDelayIdleYieldMs = millis();
 
     // Start the worker task
     BaseType_t retc = pdPASS;
@@ -318,8 +316,22 @@ void BusI2C::i2cWorkerTask()
             delayMicroseconds(1);
         }
 #endif        
-        // Allow other tasks to run
-        vTaskDelay(pdMS_TO_TICKS(_loopYieldMs));
+        // Allow other tasks to run, while still guaranteeing periodic idle time when loopYieldMs == 0.
+        if (_loopYieldMs > 0)
+            vTaskDelay(pdMS_TO_TICKS(_loopYieldMs));
+        else
+        {
+            uint32_t nowMs = millis();
+            if (Raft::isTimeout(nowMs, _lastZeroDelayIdleYieldMs, I2C_BUS_ZERO_DELAY_IDLE_YIELD_PERIOD_MS))
+            {
+                _lastZeroDelayIdleYieldMs = nowMs;
+                vTaskDelay(1);
+            }
+            else
+            {
+                taskYIELD();
+            }
+        }
 
 #ifdef DEBUG_LOOP_TIMING_WITH_GPIO_NUM
         digitalWrite(DEBUG_LOOP_TIMING_WITH_GPIO_NUM, 1);
@@ -419,7 +431,7 @@ void BusI2C::i2cWorkerTask()
 #endif
 
         // Update IO expanders (if dirty)
-        _busIOExpanders.syncI2CIOStateChanges(false, std::bind(&BusI2C::i2cSendSync, this, std::placeholders::_1, std::placeholders::_2));
+        _busIOExpanders.syncI2CIOStateChanges(false, _busReqSyncFn);
 
         // Device polling
         _devicePollingMgr.taskService(micros());

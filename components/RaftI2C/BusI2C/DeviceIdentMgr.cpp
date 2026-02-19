@@ -167,8 +167,6 @@ void DeviceIdentMgr::loadOfflineResumeState(const RaftJsonIF& config)
         }
     }
 
-    if (rateMs < 10)
-        rateMs = 0;
     if (rateMs > 60000)
         rateMs = 60000;
 
@@ -873,8 +871,6 @@ bool DeviceIdentMgr::applyRateOverrideToAddress(BusElemAddrType address, uint32_
         return false;
 
     uint32_t rateMsClamped = pollRateMs;
-    if (rateMsClamped < 10)
-        rateMsClamped = 10;
     if (rateMsClamped > 60000)
         rateMsClamped = 60000;
     uint32_t pollIntervalUs = rateMsClamped * 1000;
@@ -1445,8 +1441,6 @@ void DeviceIdentMgr::setOfflineAutoResume(bool enabled, const std::vector<BusEle
             nextState.targetAddrs.insert(addr);
     }
 
-    if (nextState.rateOverrideMs < 10)
-        nextState.rateOverrideMs = 0;
     if (nextState.rateOverrideMs > 60000)
         nextState.rateOverrideMs = 60000;
 
@@ -1837,12 +1831,11 @@ String DeviceIdentMgr::deviceStatusToJson(BusElemAddrType address, bool isOnline
 /// @brief Get JSON for device type info
 /// @param address Address of element
 /// @param includePlugAndPlayInfo true to include plug and play information
-/// @param deviceTypeIndex (out) device type index
 /// @return JSON string
-String DeviceIdentMgr::getDevTypeInfoJsonByAddr(BusElemAddrType address, bool includePlugAndPlayInfo, DeviceTypeIndexType& deviceTypeIndex) const
+String DeviceIdentMgr::getDevTypeInfoJsonByAddr(BusElemAddrType address, bool includePlugAndPlayInfo) const
 {
     // Get device type index
-    deviceTypeIndex = _busStatusMgr.getDeviceTypeIndexByAddr(address);
+    uint16_t deviceTypeIndex = _busStatusMgr.getDeviceTypeIndexByAddr(address);
     if (deviceTypeIndex == DEVICE_TYPE_INDEX_INVALID)
         return "{}";
 
@@ -1854,12 +1847,10 @@ String DeviceIdentMgr::getDevTypeInfoJsonByAddr(BusElemAddrType address, bool in
 /// @brief Get JSON for device type info
 /// @param deviceType Device type
 /// @param includePlugAndPlayInfo true to include plug and play information
-/// @param deviceTypeIndex (out) device type index
 /// @return JSON string
-String DeviceIdentMgr::getDevTypeInfoJsonByTypeName(const String& deviceType, bool includePlugAndPlayInfo, DeviceTypeIndexType& deviceTypeIndex) const
+String DeviceIdentMgr::getDevTypeInfoJsonByTypeName(const String& deviceType, bool includePlugAndPlayInfo) const
 {
-    // Get device type info
-    return deviceTypeRecords.getDevTypeInfoJsonByTypeName(deviceType, includePlugAndPlayInfo, deviceTypeIndex);
+    return deviceTypeRecords.getDevTypeInfoJsonByTypeName(deviceType, includePlugAndPlayInfo);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1950,10 +1941,6 @@ String DeviceIdentMgr::getQueuedDeviceDataJson(uint32_t maxResponsesToReturn, ui
         // Get bus status for each address
         bool isOnline = false;
         uint16_t deviceTypeIndex = _busStatusMgr.getDeviceTypeIndexByAddr(address);
-        DeviceTypeRecord devTypeRec;
-        const char* devTypeName = nullptr;
-        if (deviceTypeRecords.getDeviceInfo(deviceTypeIndex, devTypeRec))
-            devTypeName = devTypeRec.deviceType;
         std::vector<uint8_t> devicePollResponseData;
         uint32_t responseSize = 0;
         std::vector<OfflineDataMeta> metas;
@@ -1982,17 +1969,6 @@ String DeviceIdentMgr::getQueuedDeviceDataJson(uint32_t maxResponsesToReturn, ui
             remainingTotal += stats.depth;
             numResponses = _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, 
                         devicePollResponseData, responseSize, perDeviceLimit);
-        }
-
-        if ((stats.depth > 0) || (numResponses > 0) || !drainAllowed)
-        {
-            // LOG_I(MODULE_PREFIX, "offlinebuf publish addr 0x%x type %s drainAllowed %d backlogDepth %u responses %u remainTotal %u",
-            //         (unsigned)address,
-            //         devTypeName ? devTypeName : "unknown",
-            //         drainAllowed,
-            //         (unsigned)stats.depth,
-            //         (unsigned)numResponses,
-            //         (unsigned)remainingTotal);
         }
 
         // Use device identity manager to convert to JSON

@@ -50,10 +50,9 @@ public:
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief setup
-    /// @param busNum - bus number
     /// @param config - configuration
     /// @return true if setup was successful
-    virtual bool setup(BusNumType busNum, const RaftJsonIF& config) override final;
+    virtual bool setup(const RaftJsonIF& config) override final;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Close bus
@@ -189,6 +188,15 @@ public:
     {
         return _busStatusMgr.setDevicePollInterval(address, pollIntervalMs);
     }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// @brief Get device polling interval for an address
+    /// @param address Composite address
+    /// @return polling interval in microseconds
+    virtual uint32_t getDevicePollIntervalUs(BusElemAddrType address) const override final
+    {
+        return _busStatusMgr.getDevicePollIntervalUs(address);
+    }
         
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Set virtual pin levels on IO expander (pins must be on the same expander or on GPIO)
@@ -231,7 +239,10 @@ public:
 private:
 
     // Yield value on each bus processing loop
-    static const uint32_t I2C_BUS_LOOP_YIELD_MS = 5;
+    static const uint32_t I2C_BUS_LOOP_YIELD_MS = 0;
+
+    // If loopYieldMs is zero, force an occasional blocking delay so IDLE can run and feed TWDT
+    static const uint32_t I2C_BUS_ZERO_DELAY_IDLE_YIELD_PERIOD_MS = 20;
 
     // Max fast scanning without yielding
     static const uint32_t I2C_BUS_FAST_MAX_UNYIELD_DEFAUT_MS = 10;
@@ -257,6 +268,7 @@ private:
     uint32_t _loopFastUnyieldUs = I2C_BUS_FAST_MAX_UNYIELD_DEFAUT_MS * 1000;
     uint32_t _loopSlowUnyieldUs = I2C_BUS_SLOW_MAX_UNYIELD_DEFAUT_MS * 1000;
     uint32_t _loopYieldMs = I2C_BUS_LOOP_YIELD_MS;
+    uint32_t _lastZeroDelayIdleYieldMs = 0;
 
     // Init ok
     bool _initOk = false;

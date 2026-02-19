@@ -147,7 +147,19 @@ void BusStatusMgr::loop(bool hwIsOperatingOk)
                             statusChange.deviceStatus.deviceTypeIndex);
             }
 #endif            
-            _raftBus.callBusElemStatusCB(statusChanges);
+            std::vector<BusElemAddrAndStatus> busStatusChanges;
+            busStatusChanges.reserve(statusChanges.size());
+            for (const auto& statusChange : statusChanges)
+            {
+                BusElemAddrAndStatus converted = {};
+                converted.address = statusChange.address;
+                converted.isChangeToOnline = statusChange.isChange && statusChange.isOnline;
+                converted.isChangeToOffline = statusChange.isChange && !statusChange.isOnline;
+                converted.isNewlyIdentified = statusChange.isNewlyIdentified;
+                converted.deviceTypeIndex = statusChange.deviceStatus.getDeviceTypeIndex();
+                busStatusChanges.push_back(converted);
+            }
+            _raftBus.callBusElemStatusCB(busStatusChanges);
         }
 
         // No more changes
