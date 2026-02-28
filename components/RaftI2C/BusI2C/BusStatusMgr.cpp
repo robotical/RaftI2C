@@ -12,15 +12,16 @@
 #include "DeviceIdentMgr.h"
 #include <algorithm>
 
-// #define DEBUG_HANDLE_BUS_ELEM_STATE_CHANGES
+#define WARN_ON_FAILED_TO_GET_SEMAPHORE
+
+// #define DEBUG_UPDATE_BUS_ELEM_STATE
+// #define DEBUG_UPDATE_BUS_ELEM_STATE_ON_ADDRESS 0x310
+// #define DEBUG_LOOP_PROCESS_BUS_ELEM_STATUS_CHANGES
 // #define DEBUG_CONSECUTIVE_ERROR_HANDLING
 // #define DEBUG_CONSECUTIVE_ERROR_HANDLING_ADDR 0x55
-// #define WARN_ON_FAILED_TO_GET_SEMAPHORE
 // #define DEBUG_BUS_OPERATION_STATUS
 // #define DEBUG_NO_SCANNING
-// #define DEBUG_SERVICE_BUS_ELEM_STATUS_CHANGE
 // #define DEBUG_ACCESS_BARRING_FOR_MS
-// #define DEBUG_HANDLE_BUS_DEVICE_INFO
 // #define DEBUG_HANDLE_POLL_RESULT
 // #define DEBUG_GET_POLL_RESULT
 
@@ -31,15 +32,14 @@ BusStatusMgr::BusStatusMgr(RaftBus& raftBus) :
     _raftBus(raftBus)
 {
     // Bus element status change detection
-    _busElemStatusMutex = xSemaphoreCreateMutex();
+    RaftMutex_init(_busElemStatusMutex);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// @brief Destructor
 BusStatusMgr::~BusStatusMgr()
 {
-    if (_busElemStatusMutex)
-        vSemaphoreDelete(_busElemStatusMutex);
+    RaftMutex_destroy(_busElemStatusMutex);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -86,9 +86,8 @@ void BusStatusMgr::loop(bool hwIsOperatingOk)
     // Obtain semaphore controlling access to busElemChange list and flag
     // so we can update bus and element operation status - don't worry if we can't
     // access the list as there will be other service loops
-    std::vector<BusElemAddrAndStatus> statusChanges;
     uint32_t numChanges = 0;
-    if (xSemaphoreTake(_busElemStatusMutex, 0) == pdTRUE)
+    if (RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
     {
         // Go through once and look for changes
         for (auto& addrStatus : _addrStatus)
@@ -98,32 +97,25 @@ void BusStatusMgr::loop(bool hwIsOperatingOk)
         }
 
         // Return semaphore
-        xSemaphoreGive(_busElemStatusMutex);
+        RaftMutex_unlock(_busElemStatusMutex);
     }
 
     // Check for status changes
     if (numChanges > 0)
     {
         // Make space for changes
-        statusChanges.reserve(numChanges+1);
+        std::vector<BusAddrStatus> statusChanges;
+        statusChanges.reserve(numChanges);
 
         // Get semaphore again
-        if (xSemaphoreTake(_busElemStatusMutex, 0) == pdTRUE)
+        if (RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         {
             for (auto& addrStatus : _addrStatus)
             {
                 if (addrStatus.isChange || addrStatus.isNewlyIdentified)
                 {
-                    // Handle element change
-                    BusElemAddrAndStatus statusChange = 
-                        {
-                            addrStatus.address, 
-                            addrStatus.isOnline && addrStatus.isChange,
-                            (addrStatus.wasOnceOnline && !addrStatus.isOnline) && addrStatus.isChange,
-                            addrStatus.isNewlyIdentified,
-                            addrStatus.deviceStatus.getDeviceTypeIndex()
-                        };
-                    statusChanges.push_back(statusChange);
+                    // Handle element change - create lightweight status for callback
+                    statusChanges.push_back(addrStatus.toStatusChange());
                     addrStatus.isChange = false;
                     addrStatus.isNewlyIdentified = false;
                 }
@@ -131,33 +123,57 @@ void BusStatusMgr::loop(bool hwIsOperatingOk)
                 // Check if this is the addrForLockupDetect
                 if (_addrForLockupDetectValid && 
                             (addrStatus.address == _addrForLockupDetect) && 
-                            (addrStatus.wasOnceOnline))
+                            (addrStatus.onlineState == DeviceOnlineState::OFFLINE))
                 {
-                    newBusOperationStatus = addrStatus.isOnline ? BUS_OPERATION_OK : BUS_OPERATION_FAILING;
+                    newBusOperationStatus = (addrStatus.onlineState == DeviceOnlineState::ONLINE) ? BUS_OPERATION_OK : BUS_OPERATION_FAILING;
                 }
+            }
+
+           // Unlock
+           RaftMutex_unlock(_busElemStatusMutex);
+        }
+
+        // Perform elem state change callback if required
+        if ((statusChanges.size() > 0))
+        {
+#ifdef DEBUG_LOOP_PROCESS_BUS_ELEM_STATUS_CHANGES
+            for (auto& statusChange : statusChanges)
+            {
+                LOG_I(MODULE_PREFIX, "service busElemStatusChange addr %04x isChange %s status %s devTypeIdx %d",
+                            statusChange.address,
+                            statusChange.isChange ? "Y" : "N",
+                            BusAddrStatus::getOnlineStateStr(statusChange.onlineState),
+                            statusChange.deviceTypeIndex);
+            }
+#endif            
+            _raftBus.callBusElemStatusCB(statusChanges);
+
+            // Delete records that were pending deletion (OFFLINE devices) now that callback has been made
+            // First add them to the pending deletion queue for publishing
+            if (RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
+            {
+                for (const auto& s : _addrStatus)
+                {
+                    if (s.onlineState == DeviceOnlineState::PENDING_DELETION)
+                    {
+                        // Add to pending deletion queue if not full
+                        if (_pendingDeletionQueue.size() < PENDING_DELETION_QUEUE_MAX)
+                        {
+                            _pendingDeletionQueue.push_back({s.address, s.deviceStatus.deviceTypeIndex});
+                        }
+                    }
+                }
+                _addrStatus.erase(
+                    std::remove_if(_addrStatus.begin(), _addrStatus.end(),
+                        [](const BusAddrRecord& s) { return s.onlineState == DeviceOnlineState::PENDING_DELETION; }),
+                    _addrStatus.end());
+                RaftMutex_unlock(_busElemStatusMutex);
             }
         }
 
         // No more changes
-        _busElemStatusChangeDetected = false;
+        _busElemStatusChangeDetected = false;            
     }
-
-    // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
-
-    // Perform elem state change callback if required
-    if ((statusChanges.size() > 0))
-        _raftBus.callBusElemStatusCB(statusChanges);
-
-    // Debug
-#ifdef DEBUG_SERVICE_BUS_ELEM_STATUS_CHANGE
-    for (auto& statusChange : statusChanges)
-    {
-        LOG_I(MODULE_PREFIX, "loop address %04x status change to %s",
-                    statusChange.address,
-                    statusChange.isChangeToOnline ? "online" : "offline");
-    }
-#endif
 
     // Bus operation change callback if required
     if (prevBusOperationStatus != newBusOperationStatus)
@@ -180,8 +196,13 @@ void BusStatusMgr::loop(bool hwIsOperatingOk)
 /// @return true if state has changed
 bool BusStatusMgr::updateBusElemState(BusElemAddrType address, bool elemResponding, bool& isOnline)
 {
-#ifdef DEBUG_HANDLE_BUS_ELEM_STATE_CHANGES
-    LOG_I(MODULE_PREFIX, "updateBusElemState address %04x isResponding %d", address, elemResponding);
+#ifdef DEBUG_UPDATE_BUS_ELEM_STATE
+#if defined(DEBUG_UPDATE_BUS_ELEM_STATE_ON_ADDRESS)
+    if (address == DEBUG_UPDATE_BUS_ELEM_STATE_ON_ADDRESS)
+#endif
+    {
+        LOG_I(MODULE_PREFIX, "updateBusElemState address %04x isResponding %d", address, elemResponding);
+    }
 #endif
 
     // Check for new status change
@@ -191,23 +212,22 @@ bool BusStatusMgr::updateBusElemState(BusElemAddrType address, bool elemRespondi
 
 #ifdef DEBUG_CONSECUTIVE_ERROR_HANDLING
     // Debug
-    BusAddrStatus prevStatus;
-    BusAddrStatus newStatus;
+    BusAddrRecord prevStatus;
+    BusAddrRecord newStatus;
 #endif
 
     // Obtain semaphore controlling access to busElemChange list and flag
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) == pdTRUE)
+    if (RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
     {
 
         // Find address record
-        BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+        BusAddrRecord* pAddrStatus = findAddrStatusRecordEditable(address);
 
         // If not found and element is responding then add a new record
         if ((pAddrStatus == nullptr) && elemResponding && (_addrStatus.size() < ADDR_STATUS_MAX))
         {
-            // Add new record
-            BusAddrStatus newAddrStatus;
-            newAddrStatus.address = address;
+            // Add new record (isNewlyIdentified is false - set later by setBusElemDeviceStatus when identified)
+            BusAddrRecord newAddrStatus(address, DeviceOnlineState::INITIAL, true, false);
             _addrStatus.push_back(newAddrStatus);
             pAddrStatus = &_addrStatus.back();
         }
@@ -222,7 +242,7 @@ bool BusStatusMgr::updateBusElemState(BusElemAddrType address, bool elemRespondi
 
             // Handle element response
             isNewStatusChange = pAddrStatus->handleResponding(elemResponding, flagSpuriousRecord);
-            isOnline = pAddrStatus->isOnline;
+            isOnline = pAddrStatus->onlineState == DeviceOnlineState::ONLINE;
 
 #ifdef DEBUG_CONSECUTIVE_ERROR_HANDLING
             // Debug
@@ -236,6 +256,12 @@ bool BusStatusMgr::updateBusElemState(BusElemAddrType address, bool elemRespondi
             _busElemStatusChangeDetected = true;
             _lastBusElemOnlineStatusUpdateTimeMs = millis();
             _lastPollOrStatusUpdateTimeMs = millis();
+
+            // Mark for deletion if device has gone offline (will be deleted after callback)
+            if (pAddrStatus && pAddrStatus->onlineState == DeviceOnlineState::OFFLINE)
+            {
+                pAddrStatus->onlineState = DeviceOnlineState::PENDING_DELETION;
+            }
         }
 
         // Check for spurious record detected
@@ -243,12 +269,12 @@ bool BusStatusMgr::updateBusElemState(BusElemAddrType address, bool elemRespondi
         {
             // Remove the record
             _addrStatus.erase(std::remove_if(_addrStatus.begin(), _addrStatus.end(), 
-                [address](BusAddrStatus& addrStatus) { return addrStatus.address == address; }), 
+                [address](BusAddrRecord& addrStatus) { return addrStatus.address == address; }), 
                 _addrStatus.end());
         }
 
         // Return semaphore
-        xSemaphoreGive(_busElemStatusMutex);
+        RaftMutex_unlock(_busElemStatusMutex);
 
 #ifdef DEBUG_CONSECUTIVE_ERROR_HANDLING
 #ifdef DEBUG_CONSECUTIVE_ERROR_HANDLING_ADDR
@@ -256,12 +282,12 @@ bool BusStatusMgr::updateBusElemState(BusElemAddrType address, bool elemRespondi
 #endif
         if (isNewStatusChange)
         {
-            LOG_I(MODULE_PREFIX, "updateBusElemState address %04x count %d(was %d) isOnline %d(was %d) isNewStatusChange %d(was %d) wasOnceOnline %d(was %d) isResponding %d",
+            LOG_I(MODULE_PREFIX, "updateBusElemState address %04x count %d(prev %d) state %s(prev %s) isChange %d(was %d) isResponding %d",
                         newStatus.address,
                         newStatus.count, prevStatus.count, 
-                        newStatus.isOnline, prevStatus.isOnline, 
+                        BusAddrStatus::getOnlineStateStr(newStatus.onlineState),
+                        BusAddrStatus::getOnlineStateStr(prevStatus.onlineState),
                         newStatus.isChange, prevStatus.isChange, 
-                        newStatus.wasOnceOnline, prevStatus.wasOnceOnline, 
                         elemResponding);
         }
 #endif
@@ -289,16 +315,16 @@ BusOperationStatus BusStatusMgr::isElemOnline(BusElemAddrType address) const
 
     // Obtain semaphore controlling access to busElemChange list and flag
     BusOperationStatus onlineStatus = BUS_OPERATION_UNKNOWN;
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) == pdTRUE)
+    if (RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
     {
         // Find address record
-        const BusAddrStatus* pAddrStatus = findAddrStatusRecord(address);
-        if (!pAddrStatus || !pAddrStatus->wasOnceOnline)
+        const BusAddrRecord* pAddrStatus = findAddrStatusRecord(address);
+        if (!pAddrStatus || (pAddrStatus->onlineState != DeviceOnlineState::OFFLINE))
             onlineStatus = BUS_OPERATION_UNKNOWN;
         else
-            onlineStatus = pAddrStatus->isOnline ? BUS_OPERATION_OK : BUS_OPERATION_FAILING;
+            onlineStatus = (pAddrStatus->onlineState == DeviceOnlineState::ONLINE) ? BUS_OPERATION_OK : BUS_OPERATION_FAILING;
         // Return semaphore
-        xSemaphoreGive(_busElemStatusMutex);
+        RaftMutex_unlock(_busElemStatusMutex);
     }
     return onlineStatus;
 }
@@ -309,14 +335,14 @@ BusOperationStatus BusStatusMgr::isElemOnline(BusElemAddrType address) const
 uint32_t BusStatusMgr::getAddrStatusCount() const
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return 0;
 
     // Get count
     uint32_t count = _addrStatus.size();
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
     return count;
 }
 
@@ -328,11 +354,11 @@ uint32_t BusStatusMgr::getAddrStatusCount() const
 void BusStatusMgr::barElemAccessSet(uint32_t timeNowMs, BusElemAddrType address, uint32_t barAccessAfterSendMs)
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return;
 
     // Find address record
-    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    BusAddrRecord* pAddrStatus = findAddrStatusRecordEditable(address);
     if (pAddrStatus)
     {
         // Set access barring
@@ -341,7 +367,7 @@ void BusStatusMgr::barElemAccessSet(uint32_t timeNowMs, BusElemAddrType address,
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
 
 #ifdef DEBUG_ACCESS_BARRING_FOR_MS
     LOG_W(MODULE_PREFIX, "barElemAccessSet %s barring bus access for address %04x for %dms",
@@ -358,7 +384,7 @@ void BusStatusMgr::barElemAccessSet(uint32_t timeNowMs, BusElemAddrType address,
 bool BusStatusMgr::barElemAccessGet(uint32_t timeNowMs, BusElemAddrType address)
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return false;
 
     // Find address record
@@ -366,7 +392,7 @@ bool BusStatusMgr::barElemAccessGet(uint32_t timeNowMs, BusElemAddrType address)
 #ifdef DEBUG_ACCESS_BARRING_FOR_MS
     bool barReleased = false;
 #endif
-    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    BusAddrRecord* pAddrStatus = findAddrStatusRecordEditable(address);
 
     // Check if access is barred
     if (pAddrStatus && pAddrStatus->barDurationMs != 0)
@@ -386,7 +412,7 @@ bool BusStatusMgr::barElemAccessGet(uint32_t timeNowMs, BusElemAddrType address)
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
 
 #ifdef DEBUG_ACCESS_BARRING_FOR_MS
     if (accessBarred)
@@ -410,41 +436,41 @@ bool BusStatusMgr::barElemAccessGet(uint32_t timeNowMs, BusElemAddrType address)
 /// @param deviceStatus device status
 void BusStatusMgr::setBusElemDeviceStatus(BusElemAddrType address, const DeviceStatus& deviceStatus)
 {
-    // Obtain sempahore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    // Obtain semaphore
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return;
 
     // Find address record
-    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    BusAddrRecord* pAddrStatus = findAddrStatusRecordEditable(address);
     if (pAddrStatus)
     {
         // Set device status (includes device type index)
         pAddrStatus->deviceStatus = deviceStatus;
 
         // Check if device type index is valid - if so this is a new identification
-        if (deviceStatus.getDeviceTypeIndex() != DeviceStatus::DEVICE_TYPE_INDEX_INVALID)
+        if (deviceStatus.getDeviceTypeIndex() != DEVICE_TYPE_INDEX_INVALID)
         {
             pAddrStatus->isNewlyIdentified = true;
+            _busElemStatusChangeDetected = true;
         }
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// @brief Get device type index by address
 /// @param address address
 /// @return device type index
-uint16_t BusStatusMgr::getDeviceTypeIndexByAddr(BusElemAddrType address) const
+DeviceTypeIndexType BusStatusMgr::getDeviceTypeIndexByAddr(BusElemAddrType address) const
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
-        return DeviceStatus::DEVICE_TYPE_INDEX_INVALID;
-
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
+        return DEVICE_TYPE_INDEX_INVALID;
     // Find address record
-    uint16_t deviceTypeIndex = DeviceStatus::DEVICE_TYPE_INDEX_INVALID;
-    const BusAddrStatus* pAddrStatus = findAddrStatusRecord(address);
+    DeviceTypeIndexType deviceTypeIndex = DEVICE_TYPE_INDEX_INVALID;
+    const BusAddrRecord* pAddrStatus = findAddrStatusRecord(address);
     if (pAddrStatus)
     {
         // Get device type index
@@ -452,7 +478,7 @@ uint16_t BusStatusMgr::getDeviceTypeIndexByAddr(BusElemAddrType address) const
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
     return deviceTypeIndex;
 }
 
@@ -463,12 +489,12 @@ uint16_t BusStatusMgr::getDeviceTypeIndexByAddr(BusElemAddrType address) const
 bool BusStatusMgr::isAddrBeingPolled(BusElemAddrType address) const
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return false;
 
     // Check if the address is being polled
     bool isBeingPolled = false;
-    const BusAddrStatus* pAddrStatus = findAddrStatusRecord(address);
+    const BusAddrRecord* pAddrStatus = findAddrStatusRecord(address);
     if (pAddrStatus)
     {
         // Check if the address is being polled
@@ -476,7 +502,7 @@ bool BusStatusMgr::isAddrBeingPolled(BusElemAddrType address) const
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
     return isBeingPolled;
 }
 
@@ -486,16 +512,16 @@ bool BusStatusMgr::isAddrBeingPolled(BusElemAddrType address) const
 void BusStatusMgr::goingOffline(std::vector<BusElemAddrType>& addrList)
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return;
 
     // Go through all devices and set status
-    for (BusAddrStatus& addrStatus : _addrStatus)
+    for (BusAddrRecord& addrStatus : _addrStatus)
     {
         if (std::find(addrList.begin(), addrList.end(), addrStatus.address) != addrList.end())
         {
-            addrStatus.isChange = addrStatus.isOnline;
-            addrStatus.isOnline = false;
+            addrStatus.isChange = addrStatus.onlineState == DeviceOnlineState::ONLINE;
+            addrStatus.onlineState = DeviceOnlineState::OFFLINE;
             _busElemStatusChangeDetected = true;
             _lastBusElemOnlineStatusUpdateTimeMs = millis();
             _lastPollOrStatusUpdateTimeMs = millis();
@@ -503,7 +529,7 @@ void BusStatusMgr::goingOffline(std::vector<BusElemAddrType>& addrList)
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -511,15 +537,15 @@ void BusStatusMgr::goingOffline(std::vector<BusElemAddrType>& addrList)
 void BusStatusMgr::informBusStuck()
 {
     // Get semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return;
 
     // Go through all devices and set status to offline
     bool anySet = false;
-    for (BusAddrStatus& addrStatus : _addrStatus)
+    for (BusAddrRecord& addrStatus : _addrStatus)
     {
-        addrStatus.isChange = addrStatus.isOnline;
-        addrStatus.isOnline = false;
+        addrStatus.isChange = addrStatus.onlineState == DeviceOnlineState::ONLINE;
+        addrStatus.onlineState = DeviceOnlineState::OFFLINE;
         anySet = true;
     }
     _busElemStatusChangeDetected = anySet;
@@ -530,7 +556,7 @@ void BusStatusMgr::informBusStuck()
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -540,23 +566,23 @@ void BusStatusMgr::informBusStuck()
 bool BusStatusMgr::getPendingIdentPoll(uint64_t timeNowUs, DevicePollingInfo& pollInfo)
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return false;
 
     // Check for any pending requests
-    for (BusAddrStatus& addrStatus : _addrStatus)
+    for (BusAddrRecord& addrStatus : _addrStatus)
     {
         // Check if a poll is due
         if (addrStatus.deviceStatus.getPendingIdentPollInfo(timeNowUs, pollInfo))
         {
             // Return semaphore
-            xSemaphoreGive(_busElemStatusMutex);
+            RaftMutex_unlock(_busElemStatusMutex);
             return true;
         }
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
     return false;
 }
 
@@ -580,11 +606,11 @@ bool BusStatusMgr::handlePollResult(uint32_t nextReqIdx, uint64_t timeNowUs, Bus
     uint32_t timeNowMs = timeNowUs / 1000;
 
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return false;
 
     // Find address record
-    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    BusAddrRecord* pAddrStatus = findAddrStatusRecordEditable(address);
     bool putResult = false;
     if (pAddrStatus)
     {
@@ -619,7 +645,7 @@ bool BusStatusMgr::handlePollResult(uint32_t nextReqIdx, uint64_t timeNowUs, Bus
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
 
     // Check if a callback is required
     if (pCallback)
@@ -660,13 +686,13 @@ uint64_t BusStatusMgr::getDeviceInfoTimestampMs(bool includeElemOnlineStatusChan
 bool BusStatusMgr::getBusElemAddresses(std::vector<BusElemAddrType>& addresses, bool onlyAddressesWithIdentPollResponses) const
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return false;
 
     // Iterate address status records
-    for (const BusAddrStatus& addrStatus : _addrStatus)
+    for (const BusAddrRecord& addrStatus : _addrStatus)
     {
-        bool includeAddr = !onlyAddressesWithIdentPollResponses || addrStatus.deviceStatus.dataAggregator.count() > 0;
+        bool includeAddr = !onlyAddressesWithIdentPollResponses || addrStatus.deviceStatus.getPollRespCount() > 0;
         if (includeAddr)
         {
             // Add address to list
@@ -675,51 +701,65 @@ bool BusStatusMgr::getBusElemAddresses(std::vector<BusElemAddrType>& addresses, 
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
     return addresses.size() > 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////    
 /// @brief Get bus element poll responses for a specific address
 /// @param address - address of device to get responses for
-/// @param isOnline - (out) true if device is online
+/// @param onlineState - (out) device online state
 /// @param deviceTypeIndex - (out) device type index
 /// @param devicePollResponseData - (out) vector to store the device poll response data
 /// @param responseSize - (out) size of the response data
 /// @param maxResponsesToReturn - maximum number of responses to return (0 for no limit)
 /// @return number of responses returned
-uint32_t BusStatusMgr::getBusElemPollResponses(BusElemAddrType address, bool& isOnline, uint16_t& deviceTypeIndex, 
+uint32_t BusStatusMgr::getBusElemPollResponses(BusElemAddrType address, DeviceOnlineState& onlineState, uint16_t& deviceTypeIndex, 
             std::vector<uint8_t>& devicePollResponseData, 
             uint32_t& responseSize, uint32_t maxResponsesToReturn)
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return 0;
 
     // Find address record
     uint32_t numResponses = 0;
-    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    BusAddrRecord* pAddrStatus = findAddrStatusRecordEditable(address);
     if (pAddrStatus)
     {
-        // Elem online
-        isOnline = pAddrStatus->isOnline;
+        // Device online state
+        onlineState = pAddrStatus->onlineState;
         
         // Device type index
         deviceTypeIndex = pAddrStatus->deviceStatus.getDeviceTypeIndex();
 
         // Get results from aggregator
-        numResponses = pAddrStatus->deviceStatus.dataAggregator.get(devicePollResponseData, responseSize, maxResponsesToReturn);
+        numResponses = pAddrStatus->deviceStatus.getPollResponses(devicePollResponseData, responseSize, maxResponsesToReturn);
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
 
 #ifdef DEBUG_GET_POLL_RESULT
-    LOG_I(MODULE_PREFIX, "getBusElemPollResponses address %04x isOnline %d deviceTypeIndex %d numResponses %d responseSize %d",
-                address, isOnline, deviceTypeIndex, numResponses, responseSize);
+    LOG_I(MODULE_PREFIX, "getBusElemPollResponses address %04x onlineState %s deviceTypeIndex %d numResponses %d responseSize %d",
+                address, BusAddrStatus::getOnlineStateStr(onlineState), deviceTypeIndex, numResponses, responseSize);
 #endif
 
     return numResponses;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Get pending deletions and clear the queue
+/// @param deletions (out) vector to receive pending deletions
+void BusStatusMgr::getPendingDeletions(std::vector<DeletionNotice>& deletions)
+{
+    deletions.clear();
+    if (RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
+    {
+        deletions = std::move(_pendingDeletionQueue);
+        _pendingDeletionQueue.clear();
+        RaftMutex_unlock(_busElemStatusMutex);
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -728,12 +768,12 @@ uint32_t BusStatusMgr::getBusElemPollResponses(BusElemAddrType address, bool& is
 String BusStatusMgr::getDebugJSON(bool includeBraces) const
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return "{}";
 
     // Create JSON
     String jsonStr;
-    for (const BusAddrStatus& addrStatus : _addrStatus)
+    for (const BusAddrRecord& addrStatus : _addrStatus)
     {
         if (jsonStr.length() > 0)
             jsonStr += ",";
@@ -741,7 +781,7 @@ String BusStatusMgr::getDebugJSON(bool includeBraces) const
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
     jsonStr = "\"o\":" + String(_busOperationStatus ? 1 : 0) + ",\"d\":[" + jsonStr + "]";
     if (includeBraces)
         jsonStr = "{" + jsonStr + "}";
@@ -755,20 +795,98 @@ String BusStatusMgr::getDebugJSON(bool includeBraces) const
 /// @return true if address found and updated
 bool BusStatusMgr::setDevicePollInterval(BusElemAddrType address, uint32_t pollIntervalUs)
 {
+    return setDevicePollIntervalUs(address, pollIntervalUs);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Set device polling interval for a specific address
+/// @param address address
+/// @param pollIntervalUs poll interval in microseconds
+/// @return true if address found and updated
+bool BusStatusMgr::setDevicePollIntervalUs(BusElemAddrType address, uint32_t pollIntervalUs)
+{
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(5)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return false;
 
     bool updated = false;
-    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    BusAddrRecord* pAddrStatus = findAddrStatusRecordEditable(address);
     if (pAddrStatus)
     {
         pAddrStatus->deviceStatus.deviceIdentPolling.pollIntervalUs = pollIntervalUs;
         updated = true;
     }
 
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
     return updated;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Get device polling interval for a specific address
+/// @param address address
+/// @return poll interval in microseconds (0 if address not found or not being polled)
+uint64_t BusStatusMgr::getDevicePollIntervalUs(BusElemAddrType address) const
+{
+    // Obtain semaphore
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
+        return 0;
+
+    uint64_t pollIntervalUs = 0;
+    const BusAddrRecord* pAddrStatus = findAddrStatusRecord(address);
+    if (pAddrStatus)
+    {
+        pollIntervalUs = pAddrStatus->deviceStatus.deviceIdentPolling.pollIntervalUs;
+    }
+
+    RaftMutex_unlock(_busElemStatusMutex);
+    return pollIntervalUs;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Set number of poll result samples to store for a specific address
+/// @param address address
+/// @param numSamples number of samples to store
+/// @return true if address found and updated
+bool BusStatusMgr::setDeviceNumSamples(BusElemAddrType address, uint32_t numSamples)
+{
+    // Obtain semaphore
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
+        return false;
+
+    bool updated = false;
+    BusAddrRecord* pAddrRecord = findAddrStatusRecordEditable(address);
+    if (pAddrRecord)
+    {
+        // Update the stored config value
+        pAddrRecord->deviceStatus.deviceIdentPolling.numPollResultsToStore = numSamples;
+        // Resize the live aggregator
+        if (pAddrRecord->deviceStatus.pDataAggregator)
+            updated = pAddrRecord->deviceStatus.pDataAggregator->resize(numSamples);
+    }
+
+    RaftMutex_unlock(_busElemStatusMutex);
+    return updated;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// @brief Get number of poll result samples stored for a specific address
+/// @param address address
+/// @return number of samples (0 if address not found)
+uint32_t BusStatusMgr::getDeviceNumSamples(BusElemAddrType address) const
+{
+    // Obtain semaphore
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
+        return 0;
+
+    uint32_t numSamples = 0;
+    const BusAddrRecord* pAddrRecord = findAddrStatusRecord(address);
+    if (pAddrRecord)
+    {
+        numSamples = pAddrRecord->deviceStatus.deviceIdentPolling.numPollResultsToStore;
+    }
+
+    RaftMutex_unlock(_busElemStatusMutex);
+    return numSamples;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -781,11 +899,11 @@ void BusStatusMgr::registerForDeviceData(BusElemAddrType address, RaftDeviceData
             uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo)
 {
     // Obtain semaphore
-    if (xSemaphoreTake(_busElemStatusMutex, pdMS_TO_TICKS(1)) != pdTRUE)
+    if (!RaftMutex_lock(_busElemStatusMutex, RAFT_MUTEX_WAIT_FOREVER))
         return;
 
     // Find address record
-    BusAddrStatus* pAddrStatus = findAddrStatusRecordEditable(address);
+    BusAddrRecord* pAddrStatus = findAddrStatusRecordEditable(address);
     if (pAddrStatus)
     {
         // Register for data change
@@ -793,5 +911,5 @@ void BusStatusMgr::registerForDeviceData(BusElemAddrType address, RaftDeviceData
     }
 
     // Return semaphore
-    xSemaphoreGive(_busElemStatusMutex);
+    RaftMutex_unlock(_busElemStatusMutex);
 }

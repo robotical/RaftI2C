@@ -19,7 +19,6 @@
 #include "DevicePollingMgr.h"
 #include "BusPowerController.h"
 #include "BusStuckHandler.h"
-#include "BusI2CAddrAndSlot.h"
 
 // #define DEBUG_RAFT_BUSI2C_MEASURE_I2C_LOOP_TIME
 
@@ -51,9 +50,10 @@ public:
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief setup
+    /// @param busNum - bus number
     /// @param config - configuration
     /// @return true if setup was successful
-    virtual bool setup(const RaftJsonIF& config) override final;
+    virtual bool setup(BusNumType busNum, const RaftJsonIF& config) override final;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Close bus
@@ -159,17 +159,17 @@ public:
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////    
     /// @brief Get bus element poll responses for a specific address
     /// @param address - address of device to get responses for
-    /// @param isOnline - (out) true if device is online
+    /// @param onlineState - (out) device online state
     /// @param deviceTypeIndex - (out) device type index
     /// @param devicePollResponseData - (out) vector to store the device poll response data
     /// @param responseSize - (out) size of the response data
     /// @param maxResponsesToReturn - maximum number of responses to return (0 for no limit)
     /// @return number of responses returned
-    virtual uint32_t getBusElemPollResponses(uint32_t address, bool& isOnline, uint16_t& deviceTypeIndex, 
+    virtual uint32_t getBusElemPollResponses(uint32_t address, DeviceOnlineState& onlineState, uint16_t& deviceTypeIndex, 
                 std::vector<uint8_t>& devicePollResponseData, 
                 uint32_t& responseSize, uint32_t maxResponsesToReturn) override final
     {
-        return _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, devicePollResponseData, responseSize, maxResponsesToReturn);
+        return _busStatusMgr.getBusElemPollResponses(address, onlineState, deviceTypeIndex, devicePollResponseData, responseSize, maxResponsesToReturn);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -181,24 +181,41 @@ public:
     }
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    /// @brief Convert bus address to string
-    /// @param addr - address
-    /// @return address as a string
-    virtual String addrToString(BusElemAddrType addr) const override final
+    /// @brief Set device polling interval for an address
+    /// @param address Composite address
+    /// @param pollIntervalUs Polling interval in microseconds
+    /// @return true if applied
+    virtual bool setDevicePollIntervalUs(BusElemAddrType address, uint64_t pollIntervalUs) override final
     {
-        BusI2CAddrAndSlot addrAndSlot = BusI2CAddrAndSlot::fromBusElemAddrType(addr);
-        return addrAndSlot.toString();
+        return _busStatusMgr.setDevicePollIntervalUs(address, pollIntervalUs);
+    }
+    
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// @brief Get device polling interval for an address
+    /// @param address Composite address
+    /// @return Polling interval in microseconds (0 if not supported)
+    virtual uint64_t getDevicePollIntervalUs(BusElemAddrType address) const override final
+    {
+        return _busStatusMgr.getDevicePollIntervalUs(address);
     }
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    /// @brief Convert string to bus address
-    /// @param addrStr - address as a string
-    /// @return address
-    virtual BusElemAddrType stringToAddr(const String& addrStr) const override final
+    /// @brief Set number of poll result samples to store for an address
+    /// @param address Composite address
+    /// @param numSamples Number of samples to store
+    /// @return true if applied
+    virtual bool setDeviceNumSamples(BusElemAddrType address, uint32_t numSamples) override final
     {
-        BusI2CAddrAndSlot addrAndSlot;
-        addrAndSlot.fromString(addrStr);
-        return addrAndSlot.toBusElemAddrType();
+        return _busStatusMgr.setDeviceNumSamples(address, numSamples);
+    }
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    /// @brief Get number of poll result samples stored for an address
+    /// @param address Composite address
+    /// @return Number of samples (0 if not supported)
+    virtual uint32_t getDeviceNumSamples(BusElemAddrType address) const override final
+    {
+        return _busStatusMgr.getDeviceNumSamples(address);
     }
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////

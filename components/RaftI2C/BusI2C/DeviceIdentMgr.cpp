@@ -11,15 +11,17 @@
 #include "BusRequestInfo.h"
 #include "RaftDevice.h"
 #include "BusI2CAddrAndSlot.h"
+#include "PollDataAggregator.h"
 #include "Logger.h"
+#include <memory>
 
 // Info
 #define INFO_NEW_DEVICE_IDENTIFIED
 
 // Debug
-// #define DEBUG_DEVICE_IDENT_MGR
+#define DEBUG_DEVICE_IDENT_MGR
 // #define DEBUG_DEVICE_IDENT_MGR_DETAIL
-// #define DEBUG_HANDLE_BUS_DEVICE_INFO
+#define DEBUG_HANDLE_BUS_DEVICE_INFO
 // #define DEBUG_GET_DECODED_POLL_RESPONSES
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -42,7 +44,7 @@ void DeviceIdentMgr::setup(const RaftJsonIF& config)
     _isEnabled = config.getBool("identEnable", true);
 
     // Debug
-    LOG_I(MODULE_PREFIX, "DeviceIdentMgr setup %s", _isEnabled ? "enabled" : "disabled");
+    LOG_I(MODULE_PREFIX, "setup %s", _isEnabled ? "enabled" : "disabled");
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -69,7 +71,7 @@ void DeviceIdentMgr::identifyDevice(BusElemAddrType address, DeviceStatus& devic
     if (!_isEnabled)
     {
 #ifdef DEBUG_DEVICE_IDENT_MGR
-        LOG_I(MODULE_PREFIX, "Device identification disabled");
+        LOG_I(MODULE_PREFIX, "identifyDevice disabled");
 #endif
         return;
     }
@@ -114,8 +116,10 @@ void DeviceIdentMgr::identifyDevice(BusElemAddrType address, DeviceStatus& devic
             deviceTypeRecords.getPollInfo(address, &devTypeRec, deviceStatus.deviceIdentPolling);
 
             // Set polling results size
-            deviceStatus.dataAggregator.init(deviceStatus.deviceIdentPolling.numPollResultsToStore, 
+            auto pDataAggregator = std::make_shared<PollDataAggregator>(
+                    deviceStatus.deviceIdentPolling.numPollResultsToStore,
                     deviceStatus.deviceIdentPolling.pollResultSizeIncTimestamp);
+            deviceStatus.setAndOwnPollDataAggregator(pDataAggregator);
 
 #ifdef DEBUG_HANDLE_BUS_DEVICE_INFO
             LOG_I(MODULE_PREFIX, "setBusElemDevInfo address %s numPollResToStore %d pollResSizeIncTimestamp %d", 
@@ -282,41 +286,40 @@ bool DeviceIdentMgr::processDeviceInit(BusElemAddrType address, const DeviceType
 // Format device poll responses to JSON
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-String DeviceIdentMgr::deviceStatusToJson(BusElemAddrType address, bool isOnline, uint16_t deviceTypeIndex, 
+String DeviceIdentMgr::deviceStatusToJson(BusElemAddrType address, DeviceOnlineState onlineState, uint16_t deviceTypeIndex, 
                 const std::vector<uint8_t>& devicePollResponseData, uint32_t responseSize) const
 {
-    // Get device type info
-    DeviceTypeRecord devTypeRec;
-    if (!deviceTypeRecords.getDeviceInfo(deviceTypeIndex, devTypeRec))
-        return "";
-
-    // Get the poll response JSON
-    return deviceTypeRecords.deviceStatusToJson(address, isOnline, &devTypeRec, devicePollResponseData);
+    // Get the poll response JSON using DeviceOnlineState directly
+    return deviceTypeRecords.deviceStatusToJson(address, onlineState, deviceTypeIndex, devicePollResponseData);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// @brief Get JSON for device type info
 /// @param address Address of element
+/// @param includePlugAndPlayInfo true to include plug and play information
+/// @param deviceTypeIndex (out) device type index
 /// @return JSON string
-String DeviceIdentMgr::getDevTypeInfoJsonByAddr(BusElemAddrType address, bool includePlugAndPlayInfo) const
+String DeviceIdentMgr::getDevTypeInfoJsonByAddr(BusElemAddrType address, bool includePlugAndPlayInfo, DeviceTypeIndexType& deviceTypeIndex) const
 {
     // Get device type index
-    uint16_t deviceTypeIdx = _busStatusMgr.getDeviceTypeIndexByAddr(address);
-    if (deviceTypeIdx == DeviceStatus::DEVICE_TYPE_INDEX_INVALID)
+    deviceTypeIndex = _busStatusMgr.getDeviceTypeIndexByAddr(address);
+    if (deviceTypeIndex == DEVICE_TYPE_INDEX_INVALID)
         return "{}";
 
     // Get device type info
-    return deviceTypeRecords.getDevTypeInfoJsonByTypeIdx(deviceTypeIdx, includePlugAndPlayInfo);
+    return deviceTypeRecords.getDevTypeInfoJsonByTypeIdx(deviceTypeIndex, includePlugAndPlayInfo);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// @brief Get JSON for device type info
 /// @param deviceType Device type
+/// @param includePlugAndPlayInfo true to include plug and play information
+/// @param deviceTypeIndex (out) device type index
 /// @return JSON string
-String DeviceIdentMgr::getDevTypeInfoJsonByTypeName(const String& deviceType, bool includePlugAndPlayInfo) const
+String DeviceIdentMgr::getDevTypeInfoJsonByTypeName(const String& deviceType, bool includePlugAndPlayInfo, DeviceTypeIndexType& deviceTypeIndex) const
 {
     // Get device type info
-    return deviceTypeRecords.getDevTypeInfoJsonByTypeName(deviceType, includePlugAndPlayInfo);
+    return deviceTypeRecords.getDevTypeInfoJsonByTypeName(deviceType, includePlugAndPlayInfo, deviceTypeIndex);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -324,7 +327,7 @@ String DeviceIdentMgr::getDevTypeInfoJsonByTypeName(const String& deviceType, bo
 /// @param deviceTypeIdx device type index
 /// @param includePlugAndPlayInfo include plug and play info
 /// @return JSON string
-String DeviceIdentMgr::getDevTypeInfoJsonByTypeIdx(uint16_t deviceTypeIdx, bool includePlugAndPlayInfo) const
+String DeviceIdentMgr::getDevTypeInfoJsonByTypeIdx(DeviceTypeIndexType deviceTypeIdx, bool includePlugAndPlayInfo) const
 {
     // Get device type info
     return deviceTypeRecords.getDevTypeInfoJsonByTypeIdx(deviceTypeIdx, includePlugAndPlayInfo);
@@ -333,7 +336,7 @@ String DeviceIdentMgr::getDevTypeInfoJsonByTypeIdx(uint16_t deviceTypeIdx, bool 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// @brief Get queued device data in JSON format
 /// @return JSON doc
-String DeviceIdentMgr::getQueuedDeviceDataJson() const
+String DeviceIdentMgr::getQueuedDeviceDataJson()
 {
     // Return string
     String jsonStr;
@@ -344,20 +347,44 @@ String DeviceIdentMgr::getQueuedDeviceDataJson() const
     for (auto address : addresses)
     {
         // Get bus status for each address
-        bool isOnline = false;
+        DeviceOnlineState onlineState = DeviceOnlineState::OFFLINE;
         uint16_t deviceTypeIndex = 0;
         std::vector<uint8_t> devicePollResponseData;
         uint32_t responseSize = 0;
-        _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, devicePollResponseData, responseSize, 0);
+        _busStatusMgr.getBusElemPollResponses(address, onlineState, deviceTypeIndex, devicePollResponseData, responseSize, 0);
+
+        // Skip unidentified devices
+        if (deviceTypeIndex == DEVICE_TYPE_INDEX_INVALID)
+            continue;
+
+        // Skip unidentified devices
+        if (deviceTypeIndex == DEVICE_TYPE_INDEX_INVALID)
+            continue;
 
         // Use device identity manager to convert to JSON
         String jsonData = deviceStatusToJson(address, 
-                        isOnline, deviceTypeIndex, devicePollResponseData, responseSize);
+                        onlineState, deviceTypeIndex, devicePollResponseData, responseSize);
         if (jsonData.length() > 0)
         {
             jsonStr += (jsonStr.length() == 0 ? "{" : ",") + jsonData;
         }
     }
+
+    // Add pending deletion notices (devices that have been removed)
+    std::vector<BusStatusMgr::DeletionNotice> deletions;
+    _busStatusMgr.getPendingDeletions(deletions);
+    for (const auto& deletion : deletions)
+    {
+        // Generate deletion notice with empty data and PENDING_DELETION state
+        std::vector<uint8_t> emptyData;
+        String jsonData = deviceStatusToJson(deletion.address, 
+                        DeviceOnlineState::PENDING_DELETION, deletion.deviceTypeIndex, emptyData, 0);
+        if (jsonData.length() > 0)
+        {
+            jsonStr += (jsonStr.length() == 0 ? "{" : ",") + jsonData;
+        }
+    }
+
     return jsonStr.length() == 0 ? "{}" : jsonStr + "}";
 }
 
@@ -365,7 +392,7 @@ String DeviceIdentMgr::getQueuedDeviceDataJson() const
 /// @brief Get queued device data in binary format
 /// @param connMode connection mode (inc bus number)
 /// @return Binary data vector
-std::vector<uint8_t> DeviceIdentMgr::getQueuedDeviceDataBinary(uint32_t connMode) const
+std::vector<uint8_t> DeviceIdentMgr::getQueuedDeviceDataBinary(uint32_t connMode)
 {
     // Return buffer
     std::vector<uint8_t> binData;
@@ -376,18 +403,33 @@ std::vector<uint8_t> DeviceIdentMgr::getQueuedDeviceDataBinary(uint32_t connMode
     for (auto address : addresses)
     {
         // Get bus status for each address
-        bool isOnline = false;
+        DeviceOnlineState onlineState = DeviceOnlineState::OFFLINE;
         uint16_t deviceTypeIndex = 0;
         std::vector<uint8_t> devicePollResponseData;
         uint32_t responseSize = 0;
-        _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, devicePollResponseData, responseSize, 0);
+        _busStatusMgr.getBusElemPollResponses(address, onlineState, deviceTypeIndex, devicePollResponseData, responseSize, 0);
 
-        // Get poll response JSON
-        if (devicePollResponseData.size() > 0)
-        {
-            // Generate binary device message
-            RaftDevice::genBinaryDataMsg(binData, connMode, address, deviceTypeIndex, isOnline, devicePollResponseData);
-        }
+        // Skip unidentified devices
+        if (deviceTypeIndex == DEVICE_TYPE_INDEX_INVALID)
+            continue;
+
+        // Skip unidentified devices
+        if (deviceTypeIndex == DEVICE_TYPE_INDEX_INVALID)
+            continue;
+
+        // Generate binary device message
+        RaftDevice::genBinaryDataMsg(binData, connMode, address, deviceTypeIndex, onlineState, devicePollResponseData);
+    }
+
+    // Add pending deletion notices (devices that have been removed)
+    std::vector<BusStatusMgr::DeletionNotice> deletions;
+    _busStatusMgr.getPendingDeletions(deletions);
+    for (const auto& deletion : deletions)
+    {
+        // Generate deletion notice with empty data and PENDING_DELETION state
+        std::vector<uint8_t> emptyData;
+        RaftDevice::genBinaryDataMsg(binData, connMode, deletion.address, deletion.deviceTypeIndex, 
+                        DeviceOnlineState::PENDING_DELETION, emptyData);
     }
 
     // Return binary data
@@ -409,16 +451,16 @@ uint32_t DeviceIdentMgr::getDecodedPollResponses(BusElemAddrType address,
                 uint16_t maxRecCount, RaftBusDeviceDecodeState& decodeState) const
 {
     // Get poll result for each address
-    bool isOnline = false;
+    DeviceOnlineState onlineState = DeviceOnlineState::OFFLINE;
     uint16_t deviceTypeIndex = 0;
     std::vector<uint8_t> devicePollResponseData;
     uint32_t responseSize = 0;
-    _busStatusMgr.getBusElemPollResponses(address, isOnline, deviceTypeIndex, devicePollResponseData, responseSize, 0);
+    _busStatusMgr.getBusElemPollResponses(address, onlineState, deviceTypeIndex, devicePollResponseData, responseSize, 0);
 
 #ifdef DEBUG_GET_DECODED_POLL_RESPONSES
-    LOG_I(MODULE_PREFIX, "getDecodedPollResponses address %s isOnline %d deviceTypeIndex %d responseSize %d",
+    LOG_I(MODULE_PREFIX, "getDecodedPollResponses address %s onlineState %s deviceTypeIndex %d responseSize %d",
                 BusI2CAddrAndSlot::toString(address).c_str(),
-                isOnline, deviceTypeIndex, responseSize);
+                BusAddrStatus::getOnlineStateStr(onlineState), deviceTypeIndex, responseSize);
 #endif
 
     // Decode the poll response

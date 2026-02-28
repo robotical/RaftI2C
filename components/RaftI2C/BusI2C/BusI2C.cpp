@@ -13,10 +13,20 @@
 #include "RaftJsonPrefixed.h"
 #include "esp_task_wdt.h"
 #include "BusI2CConsts.h"
+#include "BusI2CAddrAndSlot.h"
+
+// Auto-select I2C implementation based on chip if not explicitly defined
+#if !defined(I2C_USE_RAFT_I2C) && !defined(I2C_USE_ESP_IDF_5)
+    #if defined(CONFIG_IDF_TARGET_ESP32C6)
+        #define I2C_USE_ESP_IDF_5
+    #else
+        #define I2C_USE_RAFT_I2C
+    #endif
+#endif
 
 #if defined(I2C_USE_RAFT_I2C)
 #include "RaftI2CCentral.h"
-#elif (defined(I2C_USE_ESP_IDF_5) || defined(I2C_USE_RAFT_I2C)) && (defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S3))
+#elif defined(I2C_USE_ESP_IDF_5)
 #include "RaftI2CCentral_ESPIDF.h"
 #endif
 
@@ -63,9 +73,9 @@ BusI2C::BusI2C(BusElemStatusCB busElemStatusCB, BusOperationStatusCB busOperatio
     _pI2CCentral = pI2CCentralIF;
     if (!_pI2CCentral)
     {
-#if defined(I2C_USE_RAFT_I2C) 
+#if defined(I2C_USE_RAFT_I2C)
         _pI2CCentral = new RaftI2CCentral();
-#elif (defined(I2C_USE_ESP_IDF_5) || defined(I2C_USE_RAFT_I2C)) && (defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S3))
+#elif defined(I2C_USE_ESP_IDF_5)
         _pI2CCentral = new RaftI2CCentral_ESPIDF();
 #endif
         _i2cCentralNeedsToBeDeleted = true;
@@ -90,9 +100,10 @@ BusI2C::~BusI2C()
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// @brief Setup
+/// @param busNum - bus number
 /// @param config Configuration
 /// @return true if successful
-bool BusI2C::setup(const RaftJsonIF& config)
+bool BusI2C::setup(BusNumType busNum, const RaftJsonIF& config)
 {
     // Note:
     // No attempt is made here to clean-up properly
@@ -102,6 +113,7 @@ bool BusI2C::setup(const RaftJsonIF& config)
     // Check if already configured
     if (_initOk)
         return false;
+    _busNum = busNum;
 
     // Get bus details
     _i2cPort = config.getLong("i2cPort", 0);
@@ -496,14 +508,14 @@ RaftRetCode BusI2C::i2cSendSync(const BusRequestInfo* pReqRec, std::vector<uint8
 #ifdef DEBUG_I2C_SEND_HELPERS_DETAIL_MAX_BYTES
     String writeDataHexStr;
     Raft::getHexStrFromBytes(pReqRec->getWriteData(), Raft::clamp(pReqRec->getWriteDataLen(), 0, DEBUG_I2C_SEND_HELPERS_DETAIL_MAX_BYTES), writeDataHexStr);
-    LOG_I(MODULE_PREFIX, "I2CSendSync %s i2cAddr 0x%02x writeLen %d readLen %d reqType %d writeData %s",
+    LOG_I(MODULE_PREFIX, "I2CSendSync %s i2cAddr %s writeLen %d readLen %d reqType %d writeData %s",
                     addrOk ? Raft::getRetCodeStr(rsltCode) : "INVALID ADDR",
-                    i2cAddr, pReqRec->getWriteDataLen(),
+                    BusI2CAddrAndSlot::toString(address).c_str(), pReqRec->getWriteDataLen(),
                     pReqRec->getReadReqLen(), pReqRec->getBusReqType(), writeDataHexStr.c_str());
 #else
-    LOG_I(MODULE_PREFIX, "I2CSendSync %saddr 0x%02x writeLen %d readLen %d reqType %d",
-                    addrOk ? Raft::getRetCodeStr(rsltCode) : "INVALID ADDR ",
-                    i2cAddr, pReqRec->getWriteDataLen(),
+    LOG_I(MODULE_PREFIX, "I2CSendSync %s addr %s writeLen %d readLen %d reqType %d",
+                    addrOk ? Raft::getRetCodeStr(rsltCode) : "INVALID ADDR",
+                    BusI2CAddrAndSlot::toString(address).c_str(), pReqRec->getWriteDataLen(),
                     pReqRec->getReadReqLen(), pReqRec->getBusReqType());
 #endif
 #ifdef DEBUG_I2C_SYNC_SEND_HELPER_ADDR_LIST
@@ -527,7 +539,7 @@ RaftRetCode BusI2C::i2cSendAsync(const BusRequestInfo* pReqRec, uint32_t pollLis
     uint16_t slotNum = BusI2CAddrAndSlot::getSlotNum(address);
 
 #ifdef DEBUG_I2C_ASYNC_SEND_HELPER
-    LOG_I(MODULE_PREFIX, "I2CSendAsync i2cAddr@slotNum %s writeLen %d readLen %d reqType %d pollListIdx %d",
+    LOG_I(MODULE_PREFIX, "I2CSendAsync addr %s writeLen %d readLen %d reqType %d pollListIdx %d",
                     BusI2CAddrAndSlot::toString(address).c_str(), pReqRec->getWriteDataLen(),
                     pReqRec->getReadReqLen(), pReqRec->getBusReqType(), pollListIdx);
 #endif

@@ -40,33 +40,35 @@ public:
     /// @brief Get device type information by address
     /// @param address address of device to get information for
     /// @param includePlugAndPlayInfo true to include plug and play information
+    /// @param deviceTypeIndex (out) device type index
     /// @return JSON string
-    virtual String getDevTypeInfoJsonByAddr(BusElemAddrType address, bool includePlugAndPlayInfo) const override final;
+    virtual String getDevTypeInfoJsonByAddr(BusElemAddrType address, bool includePlugAndPlayInfo, DeviceTypeIndexType& deviceTypeIndex) const override final;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Get device type information by device type name
     /// @param deviceType device type name
     /// @param includePlugAndPlayInfo true to include plug and play information
+    /// @param deviceTypeIndex (out) device type index
     /// @return JSON string
-    virtual String getDevTypeInfoJsonByTypeName(const String& deviceType, bool includePlugAndPlayInfo) const override final;
+    virtual String getDevTypeInfoJsonByTypeName(const String& deviceType, bool includePlugAndPlayInfo, DeviceTypeIndexType& deviceTypeIndex) const override final;
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Get device type info JSON by device type index
     /// @param deviceTypeIdx device type index
     /// @param includePlugAndPlayInfo include plug and play info
     /// @return JSON string
-    virtual String getDevTypeInfoJsonByTypeIdx(uint16_t deviceTypeIdx, bool includePlugAndPlayInfo) const override final;
+    virtual String getDevTypeInfoJsonByTypeIdx(DeviceTypeIndexType deviceTypeIdx, bool includePlugAndPlayInfo) const override final;
      
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Get queued device data in JSON format
     /// @return JSON string
-    virtual String getQueuedDeviceDataJson() const override final;
+    virtual String getQueuedDeviceDataJson() override final;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Get queued device data in binary format
     /// @param connMode connection mode (inc bus number)
     /// @return Binary data vector
-    virtual std::vector<uint8_t> getQueuedDeviceDataBinary(uint32_t connMode) const override final;
+    virtual std::vector<uint8_t> getQueuedDeviceDataBinary(uint32_t connMode) override final;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Get decoded poll responses
@@ -97,14 +99,14 @@ public:
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Register for device data notifications
-    /// @param addrAndSlot address
+    /// @param addressAndSlot address of device
     /// @param dataChangeCB Callback for data change
     /// @param minTimeBetweenReportsMs Minimum time between reports (ms)
     /// @param pCallbackInfo Callback info (passed to the callback)
-    virtual void registerForDeviceData(BusElemAddrType address, RaftDeviceDataChangeCB dataChangeCB, 
+    virtual void registerForDeviceData(BusElemAddrType addressAndSlot, RaftDeviceDataChangeCB dataChangeCB, 
                 uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo) override final
     {
-        _busStatusMgr.registerForDeviceData(address, dataChangeCB, minTimeBetweenReportsMs, pCallbackInfo);
+        _busStatusMgr.registerForDeviceData(addressAndSlot, dataChangeCB, minTimeBetweenReportsMs, pCallbackInfo);
     }
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -145,12 +147,12 @@ private:
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// @brief Format device status to JSON
     /// @param address address
-    /// @param isOnline true if device is online
+    /// @param onlineState device online state
     /// @param deviceTypeIndex index of device type
     /// @param devicePollResponseData poll response data
     /// @param responseSize size of poll response data
     /// @return JSON string
-    String deviceStatusToJson(BusElemAddrType address, bool isOnline, uint16_t deviceTypeIndex, 
+    String deviceStatusToJson(BusElemAddrType address, DeviceOnlineState onlineState, DeviceTypeIndexType deviceTypeIndex, 
                     const std::vector<uint8_t>& devicePollResponseData, uint32_t responseSize) const;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -162,11 +164,11 @@ private:
     /// @param structOutSize size of structure (in bytes) to receive decoded data
     /// @param maxRecCount maximum number of records to decode
     /// @return number of records decoded
-    uint32_t decodePollResponses(uint16_t deviceTypeIndex, 
+    uint32_t decodePollResponses(DeviceTypeIndexType deviceTypeIndex, 
                     const uint8_t* pPollBuf, uint32_t pollBufLen, 
                     void* pStructOut, uint32_t structOutSize, 
                     uint16_t maxRecCount, RaftBusDeviceDecodeState& decodeState) const;
 
     // Debug
-    static constexpr const char* MODULE_PREFIX = "RaftDevIdentMgr";
+    static constexpr const char* MODULE_PREFIX = "I2CDevIdentMgr";
 };
